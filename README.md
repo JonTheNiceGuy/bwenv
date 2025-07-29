@@ -183,3 +183,4 @@ This is a community project. For support:
 - **v1.1**: Added authentication handling and interactive password prompts
 - **v1.2**: Added flexible flag positioning support
 - **v1.3**: Consolidated into single file, improved error handling
+- **v1.4**: Default to sync on every run, rather than when specified.

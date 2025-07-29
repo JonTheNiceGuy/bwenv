@@ -208,7 +208,7 @@ class TestBitwardenClient(unittest.TestCase):
         """Test getting items with sync enabled"""
         mock_run.return_value = Mock(stdout=json.dumps(self.sample_items), returncode=0)
         
-        client = bwenv.BitwardenClient(sync=True)
+        client = bwenv.BitwardenClient(no_sync=False)
         items = client.get_items_with_op_uris()
         
         # Should call sync first, then list items

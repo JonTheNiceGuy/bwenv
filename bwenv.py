@@ -6,13 +6,13 @@ A cross-platform tool to replace environment variables containing Bitwarden secr
 with actual secret values using the Bitwarden CLI.
 
 Usage:
-    bwenv run [--sync] <command> [args...]
-    bwenv read [--sync] <uri>
+    bwenv run [--no-sync] <command> [args...]
+    bwenv read [--no-sync] <uri>
 
 Examples:
     bwenv run sh
     bwenv read op://Employee/example/secret
-    bwenv run --sync python app.py
+    bwenv run --no-sync python app.py
 """
 
 import argparse
@@ -73,8 +73,8 @@ class URIParser:
 class BitwardenClient:
     """Client for interacting with Bitwarden CLI"""
     
-    def __init__(self, sync: bool = False):
-        self.sync = sync
+    def __init__(self, no_sync: bool = False):
+        self.sync = not no_sync
         self._items_cache = None
     
     def _run_bw_command(self, args: List[str]) -> str:
@@ -333,9 +333,9 @@ class EnvironmentProcessor:
 def run_command(args: argparse.Namespace):
     """Run a command with resolved environment variables"""
     debug_print(f"Running command: {' '.join(args.cmd_args)}")
-    debug_print(f"Sync enabled: {args.sync}")
+    debug_print(f"Sync enabled: {not args.no_sync}")
     
-    bw_client = BitwardenClient(sync=args.sync)
+    bw_client = BitwardenClient(no_sync=args.no_sync)
     processor = EnvironmentProcessor(bw_client)
     
     resolved_env = processor.create_resolved_environment()
@@ -364,9 +364,9 @@ def run_command(args: argparse.Namespace):
 def read_secret(args: argparse.Namespace):
     """Read a specific secret value from a URI"""
     debug_print(f"Reading secret from URI: {args.uri}")
-    debug_print(f"Sync enabled: {args.sync}")
+    debug_print(f"Sync enabled: {not args.no_sync}")
     
-    bw_client = BitwardenClient(sync=args.sync)
+    bw_client = BitwardenClient(no_sync=args.no_sync)
     processor = EnvironmentProcessor(bw_client)
     
     try:
@@ -387,20 +387,20 @@ def main():
     )
     
     # Global options
-    parser.add_argument('--sync', action='store_true', help='Sync Bitwarden vault before processing')
+    parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Run command
     run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
-    run_parser.add_argument('--sync', action='store_true', help='Sync Bitwarden vault before processing')
+    run_parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
     run_parser.add_argument('--debug', action='store_true', help='Enable debug output')
     run_parser.add_argument('cmd_args', nargs=argparse.REMAINDER, help='Command to execute')
     
     # Read command
     read_parser = subparsers.add_parser('read', help='Read a specific secret value')
-    read_parser.add_argument('--sync', action='store_true', help='Sync Bitwarden vault before processing')
+    read_parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
     read_parser.add_argument('--debug', action='store_true', help='Enable debug output')
     read_parser.add_argument('uri', help='URI to read (e.g., op://Employee/example/secret)')
     
