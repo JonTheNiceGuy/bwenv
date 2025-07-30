@@ -9,7 +9,7 @@ A cross-platform command-line tool that replaces environment variables containin
 - **Cross-Platform**: Works on Windows, macOS, and Linux
 - **URI-Based**: Simple `op://vault/item/field` syntax for referencing secrets
 - **Interactive Authentication**: Automatically prompts for master password when needed
-- **Flexible Flags**: Global flags can be placed before or after subcommands
+- **Flexible Flag Positions**: Global flags like `--debug` and `--no-sync` can be placed before or after subcommands
 - **Debug Support**: Built-in debug mode for troubleshooting
 
 ## Prerequisites
@@ -29,8 +29,19 @@ A cross-platform command-line tool that replaces environment variables containin
 ### Basic Syntax
 
 ```bash
+# Flags can be placed before or after the subcommand
+bwenv [--no-sync] [--debug] run <command> [args...]  
+bwenv [--no-sync] run [--debug] <command> [args...]  
+bwenv [--debug] run [--no-sync] <command> [args...]
 bwenv run [--no-sync] [--debug] <command> [args...]
+bwenv [--no-sync] [--debug] run -- <command> [args...]  
+bwenv [--no-sync] run [--debug] -- <command> [args...]  
+bwenv [--debug] run [--no-sync] -- <command> [args...]
 bwenv run [--no-sync] [--debug] -- <command> [args...]
+
+# Read command supports flexible flag positions too
+bwenv [--no-sync] [--debug] read <uri>
+bwenv [--no-sync] read [--debug] <uri>
 bwenv read [--no-sync] [--debug] <uri>
 ```
 
@@ -220,3 +231,4 @@ This is a community project. For support:
 - **v1.4**: Default to sync on every run, rather than when specified
 - **v1.5**: Added `--` command separator to isolate bwenv flags from command flags. Both `./bwenv.py run echo "hello"` and `./bwenv.py run -- echo "hello"` work identically, but `./bwenv.py --no-sync run -- echo --debug "hello"` properly separates bwenv flags from command flags.
 - **v1.6**: Enhanced debug functionality with comprehensive logging including timestamps, command execution details, performance metrics, authentication status, item resolution tracking, and safe value previews.
+- **v1.7**: Fixed argument parsing to ensure consistent behavior regardless of flag positions. All flag combinations (`--debug run`, `run --debug`, etc.) now work identically while properly respecting the `--` separator boundary.
