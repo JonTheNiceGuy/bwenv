@@ -379,7 +379,37 @@ def read_secret(args: argparse.Namespace):
         sys.exit(1)
 
 
-def main():
+def parse_args_with_separator():
+    """Parse arguments handling the '--' separator for command isolation"""
+    argv = sys.argv[1:]  # Skip script name
+    
+    # Find '--' separator if it exists after 'run' command
+    separator_idx = None
+    run_idx = None
+    
+    # Find 'run' command position
+    for i, arg in enumerate(argv):
+        if arg == 'run':
+            run_idx = i
+            break
+    
+    # If we found 'run', look for '--' after it
+    if run_idx is not None:
+        for i in range(run_idx + 1, len(argv)):
+            if argv[i] == '--':
+                separator_idx = i
+                break
+    
+    if separator_idx is not None:
+        # Split arguments at '--'
+        bwenv_args = argv[:separator_idx]
+        cmd_args = argv[separator_idx + 1:]
+    else:
+        # No '--' found, use original behavior
+        bwenv_args = argv
+        cmd_args = None
+    
+    # Parse bwenv-specific arguments
     parser = argparse.ArgumentParser(
         description="Bitwarden Environment Variable Processor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -396,7 +426,9 @@ def main():
     run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
     run_parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
     run_parser.add_argument('--debug', action='store_true', help='Enable debug output')
-    run_parser.add_argument('cmd_args', nargs=argparse.REMAINDER, help='Command to execute')
+    if cmd_args is None:
+        # Original behavior - use REMAINDER
+        run_parser.add_argument('cmd_args', nargs=argparse.REMAINDER, help='Command to execute')
     
     # Read command
     read_parser = subparsers.add_parser('read', help='Read a specific secret value')
@@ -404,9 +436,30 @@ def main():
     read_parser.add_argument('--debug', action='store_true', help='Enable debug output')
     read_parser.add_argument('uri', help='URI to read (e.g., op://Employee/example/secret)')
     
-    args = parser.parse_args()
+    args = parser.parse_args(bwenv_args)
+    
+    # If we used '--' separator, manually set cmd_args
+    if cmd_args is not None and args.command == 'run':
+        args.cmd_args = cmd_args
+    
+    return args
+
+
+def main():
+    args = parse_args_with_separator()
     
     if not args.command:
+        # Show help and exit
+        parser = argparse.ArgumentParser(
+            description="Bitwarden Environment Variable Processor",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=__doc__
+        )
+        parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
+        parser.add_argument('--debug', action='store_true', help='Enable debug output')
+        subparsers = parser.add_subparsers(dest='command', help='Available commands')
+        run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
+        read_parser = subparsers.add_parser('read', help='Read a specific secret value')
         parser.print_help()
         sys.exit(1)
     
@@ -416,13 +469,24 @@ def main():
         debug_print("Debug mode enabled")
     
     if args.command == 'run':
-        if not args.cmd_args:
+        if not hasattr(args, 'cmd_args') or not args.cmd_args:
             print("Error: No command specified to run", file=sys.stderr)
             sys.exit(1)
         run_command(args)
     elif args.command == 'read':
         read_secret(args)
     else:
+        # Show help and exit
+        parser = argparse.ArgumentParser(
+            description="Bitwarden Environment Variable Processor",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=__doc__
+        )
+        parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
+        parser.add_argument('--debug', action='store_true', help='Enable debug output')
+        subparsers = parser.add_subparsers(dest='command', help='Available commands')
+        run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
+        read_parser = subparsers.add_parser('read', help='Read a specific secret value')
         parser.print_help()
         sys.exit(1)
 

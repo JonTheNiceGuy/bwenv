@@ -29,8 +29,9 @@ A cross-platform command-line tool that replaces environment variables containin
 ### Basic Syntax
 
 ```bash
-bwenv run [--sync] [--debug] <command> [args...]
-bwenv read [--sync] [--debug] <uri>
+bwenv run [--no-sync] [--debug] <command> [args...]
+bwenv run [--no-sync] [--debug] -- <command> [args...]
+bwenv read [--no-sync] [--debug] <uri>
 ```
 
 ### URI Format
@@ -66,13 +67,22 @@ bwenv --debug run python app.py
 bwenv run --debug python app.py
 ```
 
-#### Sync vault before processing:
+#### Skip vault sync for faster execution:
 ```bash
 # Global flag position
-bwenv --sync run python app.py
+bwenv --no-sync run python app.py
 
 # Subcommand flag position
-bwenv run --sync python app.py
+bwenv run --no-sync python app.py
+```
+
+#### Use command separator to isolate flags:
+```bash
+# bwenv flags before --, command flags after
+bwenv --no-sync run -- python app.py --debug
+
+# Equivalent without separator (original syntax)
+bwenv --no-sync run python app.py --debug
 ```
 
 #### Complex example:
@@ -82,8 +92,11 @@ export DB_USER="op://Production/database/username"
 export DB_PASS="op://Production/database/password"
 export API_KEY="op://Production/api-keys/service_key"
 
-# Run with debug and sync
-bwenv --debug --sync run docker-compose up
+# Run with debug and skip sync for faster execution
+bwenv --debug --no-sync run docker-compose up
+
+# Use separator to pass flags to docker-compose
+bwenv --debug run -- docker-compose up --build
 ```
 
 ## Authentication
@@ -105,11 +118,12 @@ The tool supports various field types:
 
 ## Command Line Options
 
-- `--sync`: Sync the Bitwarden vault before processing secrets
+- `--no-sync`: Skip syncing the Bitwarden vault before processing secrets (default behavior syncs)
 - `--debug`: Enable verbose debug output for troubleshooting
 - `--help`: Show help information
+- `--`: Command separator to isolate bwenv flags from command flags
 
-Flags can be placed either before or after the subcommand for flexibility.
+Flags can be placed either before or after the subcommand for flexibility. Use `--` after the `run` command to ensure that any flags following it are passed to your command rather than interpreted by bwenv.
 
 ## Testing
 
@@ -183,4 +197,5 @@ This is a community project. For support:
 - **v1.1**: Added authentication handling and interactive password prompts
 - **v1.2**: Added flexible flag positioning support
 - **v1.3**: Consolidated into single file, improved error handling
-- **v1.4**: Default to sync on every run, rather than when specified.
+- **v1.4**: Default to sync on every run, rather than when specified
+- **v1.5**: Added `--` command separator to isolate bwenv flags from command flags. Both `./bwenv.py run echo "hello"` and `./bwenv.py run -- echo "hello"` work identically, but `./bwenv.py --no-sync run -- echo --debug "hello"` properly separates bwenv flags from command flags.

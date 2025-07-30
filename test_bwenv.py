@@ -383,6 +383,105 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("You are not logged in", str(cm.exception))
 
 
+class TestArgumentParsing(unittest.TestCase):
+    """Test cases for the new '--' separator argument parsing functionality"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        # Mock sys.argv to test parse_args_with_separator
+        self.original_argv = sys.argv.copy()
+    
+    def tearDown(self):
+        """Clean up after tests"""
+        sys.argv = self.original_argv
+    
+    def test_parse_args_no_separator_original_behavior(self):
+        """Test original behavior without '--' separator"""
+        sys.argv = ['bwenv.py', 'run', '--debug', 'echo', 'hello']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertTrue(args.debug)
+        self.assertEqual(args.cmd_args, ['echo', 'hello'])
+    
+    def test_parse_args_with_separator_basic(self):
+        """Test basic '--' separator functionality"""
+        sys.argv = ['bwenv.py', 'run', '--', 'echo', 'hello']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertEqual(args.cmd_args, ['echo', 'hello'])
+    
+    def test_parse_args_with_separator_and_flags_before(self):
+        """Test '--' separator with bwenv flags before"""
+        sys.argv = ['bwenv.py', 'run', '--debug', '--no-sync', '--', 'echo', 'hello']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertTrue(args.debug)
+        self.assertTrue(args.no_sync)
+        self.assertEqual(args.cmd_args, ['echo', 'hello'])
+    
+    def test_parse_args_with_separator_and_flags_after(self):
+        """Test '--' separator with command flags after"""
+        sys.argv = ['bwenv.py', 'run', '--', 'echo', 'hello', '--debug']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertEqual(args.cmd_args, ['echo', 'hello', '--debug'])
+    
+    def test_parse_args_with_separator_flags_separated(self):
+        """Test '--' separator properly separating bwenv and command flags"""
+        sys.argv = ['bwenv.py', 'run', '--no-sync', '--', 'echo', '--debug', 'hello']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertTrue(args.no_sync)
+        self.assertFalse(args.debug)  # --debug is after --, so not for bwenv
+        self.assertEqual(args.cmd_args, ['echo', '--debug', 'hello'])
+    
+    def test_parse_args_with_separator_subcommand_flags(self):
+        """Test '--' separator with subcommand-level flags"""
+        sys.argv = ['bwenv.py', 'run', '--debug', '--', 'echo', 'hello']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertTrue(args.debug)
+        self.assertEqual(args.cmd_args, ['echo', 'hello'])
+    
+    def test_parse_args_read_command_unaffected(self):
+        """Test that read command is unaffected by separator logic"""
+        sys.argv = ['bwenv.py', 'read', '--debug', 'op://vault/item/field']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'read')
+        self.assertTrue(args.debug)
+        self.assertEqual(args.uri, 'op://vault/item/field')
+    
+    def test_parse_args_separator_not_after_run(self):
+        """Test that '--' not after 'run' is ignored"""
+        # This case should be treated as an error since -- comes before run
+        sys.argv = ['bwenv.py', '--', '--debug', 'run', 'echo', 'hello']
+        with self.assertRaises(SystemExit):
+            bwenv.parse_args_with_separator()
+    
+    def test_parse_args_multiple_separators(self):
+        """Test behavior with multiple '--' separators (only first one counts)"""
+        sys.argv = ['bwenv.py', 'run', '--', 'echo', '--', 'hello']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertEqual(args.cmd_args, ['echo', '--', 'hello'])
+    
+    def test_parse_args_empty_command_after_separator(self):
+        """Test '--' separator with empty command"""
+        sys.argv = ['bwenv.py', 'run', '--']
+        args = bwenv.parse_args_with_separator()
+        
+        self.assertEqual(args.command, 'run')
+        self.assertEqual(args.cmd_args, [])
+
+
 class TestFunctional(unittest.TestCase):
     """Functional tests for the complete bwenv workflow"""
     
@@ -418,6 +517,40 @@ class TestFunctional(unittest.TestCase):
                               capture_output=True, text=True)
         # The script should succeed because no BW lookup is needed
         self.assertEqual(result.returncode, 0)
+    
+    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
+    def test_run_command_with_separator_no_op_vars(self):
+        """Test running command with '--' separator when no op:// variables are present"""
+        result = subprocess.run(self.test_script + ['run', '--', 'echo', 'test'], 
+                              capture_output=True, text=True)
+        # The script should succeed because no BW lookup is needed
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('test', result.stdout)
+    
+    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
+    def test_separator_flag_isolation(self):
+        """Test that flags are properly isolated by '--' separator"""
+        result = subprocess.run(self.test_script + ['--no-sync', 'run', '--', 'echo', '--help'], 
+                              capture_output=True, text=True)
+        # Should succeed and echo '--help' (not show bwenv help)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('--help', result.stdout)
+        self.assertNotIn('usage:', result.stdout)
+    
+    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
+    def test_backward_compatibility(self):
+        """Test that existing usage patterns still work"""
+        # Test original flag usage
+        result = subprocess.run(self.test_script + ['--no-sync', 'run', 'echo', 'backward_compat'], 
+                              capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('backward_compat', result.stdout)
+        
+        # Test subcommand flags
+        result = subprocess.run(self.test_script + ['run', '--no-sync', 'echo', 'subcommand_flags'], 
+                              capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('subcommand_flags', result.stdout)
 
 
 if __name__ == '__main__':
