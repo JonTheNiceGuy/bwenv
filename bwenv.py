@@ -17,6 +17,7 @@ Examples:
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
@@ -24,20 +25,20 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 
-# Global debug flag
-_DEBUG = False
+def setup_logging(debug: bool = False):
+    """Setup logging configuration"""
+    level = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format='[%(levelname)s %(asctime)s] %(message)s',
+        datefmt='%H:%M:%S',
+        stream=sys.stderr
+    )
 
 
-def debug_print(*args, **kwargs):
-    """Print debug messages when debug mode is enabled"""
-    if _DEBUG:
-        print("[DEBUG]", *args, file=sys.stderr, **kwargs)
-
-
-def set_debug_mode(enabled: bool):
-    """Enable or disable debug mode"""
-    global _DEBUG
-    _DEBUG = enabled
+def debug_print(*args):
+    """Print debug messages when debug mode is enabled - kept for compatibility"""
+    logging.debug(' '.join(str(arg) for arg in args))
 
 
 class BWEnvError(Exception):
@@ -80,13 +81,21 @@ class BitwardenClient:
     def _run_bw_command(self, args: List[str]) -> str:
         """Run a Bitwarden CLI command and return stdout"""
         command = ['bw'] + args
-        debug_print(f"Running Bitwarden CLI command: {' '.join(command)}")
+        logging.debug(f"Running Bitwarden CLI command: {' '.join(command)}")
+        logging.debug(f"Command arguments: {args}")
+        logging.debug(f"Full command: {command}")
         
         # Check if we need authentication for this command
         needs_auth = any(cmd in args for cmd in ['sync', 'list', 'get'])
+        logging.debug(f"Command needs authentication: {needs_auth}")
         
-        if needs_auth and not os.environ.get('BW_SESSION'):
-            debug_print("No BW_SESSION found, checking if user is logged in...")
+        bw_session = os.environ.get('BW_SESSION')
+        logging.debug(f"BW_SESSION present: {bool(bw_session)}")
+        if bw_session:
+            logging.debug(f"BW_SESSION length: {len(bw_session)} characters")
+        
+        if needs_auth and not bw_session:
+            logging.debug("No BW_SESSION found, checking if user is logged in...")
             # First check if user is logged in but not unlocked
             try:
                 status_result = subprocess.run(
@@ -97,13 +106,16 @@ class BitwardenClient:
                 )
                 # Handle empty response from mocked tests or real empty responses
                 status_output = status_result.stdout.strip()
+                logging.debug(f"Status command output: {status_output}")
                 if not status_output:
-                    debug_print("Empty status response, will let command fail naturally if not authenticated")
+                    logging.debug("Empty status response, will let command fail naturally if not authenticated")
                 else:
                     try:
                         status_data = json.loads(status_output)
+                        logging.debug(f"Parsed status data: {status_data}")
                         if status_data.get('status') == 'locked':
                             # Vault is locked, need to unlock interactively
+                            logging.debug("Vault is locked, prompting for unlock")
                             print("Bitwarden vault is locked. Please enter your master password to unlock:", file=sys.stderr)
                             unlock_result = subprocess.run(
                                 ['bw', 'unlock', '--raw'],
@@ -115,32 +127,42 @@ class BitwardenClient:
                             )
                             session_token = unlock_result.stdout.strip()
                             os.environ['BW_SESSION'] = session_token
-                            debug_print("Successfully unlocked vault and set BW_SESSION")
+                            logging.debug("Successfully unlocked vault and set BW_SESSION")
                         elif status_data.get('status') == 'unauthenticated':
+                            logging.debug("User is not authenticated")
                             raise BWEnvError("You are not logged in")
                     except (json.JSONDecodeError, TypeError):
-                        debug_print("Failed to parse JSON status response, will let command fail naturally if not authenticated")
+                        logging.debug("Failed to parse JSON status response, will let command fail naturally if not authenticated")
             except subprocess.CalledProcessError as e:
                 stderr = e.stderr or ""
                 if "not logged in" in stderr or "You are not logged in" in stderr:
                     raise BWEnvError("You are not logged in")
-                debug_print(f"Status check failed, will let command fail naturally: {stderr.strip()}")
+                logging.debug(f"Status check failed, will let command fail naturally: {stderr.strip()}")
             except FileNotFoundError:
-                debug_print("Bitwarden CLI 'bw' command not found during status check")
+                logging.debug("Bitwarden CLI 'bw' command not found during status check")
                 raise BWEnvError("Bitwarden CLI 'bw' not found. Please install it from bitwarden.com")
         
         try:
+            logging.debug(f"Executing subprocess: {command}")
             result = subprocess.run(
                 command,
                 capture_output=True,
                 text=True,
                 check=True
             )
-            debug_print(f"Command completed successfully, output length: {len(result.stdout)} chars")
+            logging.debug(f"Command completed successfully")
+            logging.debug(f"Return code: {result.returncode}")
+            logging.debug(f"Stdout length: {len(result.stdout)} chars")
+            stderr_len = len(result.stderr) if hasattr(result.stderr, '__len__') else 'unknown'
+            logging.debug(f"Stderr length: {stderr_len} chars")
+            if result.stderr:
+                logging.debug(f"Stderr content: {result.stderr}")
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
-            debug_print(f"Command failed with error: {stderr.strip()}")
+            logging.debug(f"Command failed with return code: {e.returncode}")
+            logging.debug(f"Command failed with error: {stderr.strip()}")
+            logging.debug(f"Failed command: {' '.join(command)}")
             # Check if this is an authentication error that we can handle
             if needs_auth and not os.environ.get('BW_SESSION') and ("not logged in" in stderr.lower() or "master password" in stderr.lower()):
                 print("Bitwarden authentication required. Please enter your master password:", file=sys.stderr)
@@ -156,7 +178,7 @@ class BitwardenClient:
                     )
                     session_token = unlock_result.stdout.strip()
                     os.environ['BW_SESSION'] = session_token
-                    debug_print("Successfully unlocked vault and set BW_SESSION, retrying command")
+                    logging.debug("Successfully unlocked vault and set BW_SESSION, retrying command")
                     # Retry the original command
                     result = subprocess.run(
                         command,
@@ -164,30 +186,32 @@ class BitwardenClient:
                         text=True,
                         check=True
                     )
-                    debug_print(f"Retry completed successfully, output length: {len(result.stdout)} chars")
+                    logging.debug(f"Retry completed successfully, output length: {len(result.stdout)} chars")
                     return result.stdout.strip()
                 except subprocess.CalledProcessError as unlock_error:
                     unlock_stderr = unlock_error.stderr or ""
-                    debug_print(f"Unlock failed: {unlock_stderr.strip()}")
+                    logging.debug(f"Unlock failed: {unlock_stderr.strip()}")
                     raise BWEnvError(f"Authentication failed: {unlock_stderr.strip()}")
             raise BWEnvError(f"Bitwarden CLI error: {stderr.strip()}")
         except FileNotFoundError:
-            debug_print("Bitwarden CLI 'bw' command not found")
+            logging.debug("Bitwarden CLI 'bw' command not found")
             raise BWEnvError("Bitwarden CLI 'bw' not found. Please install it from bitwarden.com")
     
     def sync_vault(self):
         """Sync the Bitwarden vault"""
-        debug_print("Syncing Bitwarden vault...")
+        logging.debug("Syncing Bitwarden vault...")
+        sync_start_time = __import__('time').time()
         self._run_bw_command(['sync'])
-        debug_print("Vault sync completed")
+        sync_duration = __import__('time').time() - sync_start_time
+        logging.debug(f"Vault sync completed in {sync_duration:.2f} seconds")
     
     def get_items_with_op_uris(self) -> List[Dict]:
         """Get all Bitwarden items that have URIs starting with 'op://'"""
         if self._items_cache is not None:
-            debug_print(f"Using cached items ({len(self._items_cache)} items)")
+            logging.debug(f"Using cached items ({len(self._items_cache)} items)")
             return self._items_cache
         
-        debug_print("Fetching Bitwarden items with op:// URIs...")
+        logging.debug("Fetching Bitwarden items with op:// URIs...")
         
         if self.sync:
             self.sync_vault()
@@ -195,7 +219,8 @@ class BitwardenClient:
         # Get all items in JSON format
         items_json = self._run_bw_command(['list', 'items', '--search', 'op://'])
         items = json.loads(items_json)
-        debug_print(f"Found {len(items)} items from search")
+        logging.debug(f"Found {len(items)} items from search")
+        logging.debug(f"Items JSON length: {len(items_json)} characters")
         
         # Filter items that have URIs starting with 'op://'
         op_items = []
@@ -204,17 +229,17 @@ class BitwardenClient:
                 for uri_obj in item['login']['uris']:
                     if uri_obj.get('uri', '').startswith('op://'):
                         op_items.append(item)
-                        debug_print(f"Found item with op:// URI: {item.get('name', 'unnamed')}")
+                        logging.debug(f"Found item with op:// URI: {item.get('name', 'unnamed')} - URI: {uri_obj.get('uri', '')}")
                         break
         
-        debug_print(f"Filtered to {len(op_items)} items with op:// URIs")
+        logging.debug(f"Filtered to {len(op_items)} items with op:// URIs")
         self._items_cache = op_items
         return op_items
     
     def find_item_by_uri_prefix(self, vault: str, item_name: str) -> Optional[Dict]:
         """Find a Bitwarden item by matching op://vault/item prefix"""
         target_prefix = f"op://{vault}/{item_name}"
-        debug_print(f"Searching for item with prefix: {target_prefix}")
+        logging.debug(f"Searching for item with prefix: {target_prefix}")
         
         items = self.get_items_with_op_uris()
         for item in items:
@@ -222,38 +247,41 @@ class BitwardenClient:
                 for uri_obj in item['login']['uris']:
                     uri = uri_obj.get('uri', '')
                     if uri.startswith(target_prefix):
-                        debug_print(f"Found matching item: {item.get('name', 'unnamed')} (ID: {item.get('id', 'unknown')})")
+                        logging.debug(f"Found matching item: {item.get('name', 'unnamed')} (ID: {item.get('id', 'unknown')})")
+                        logging.debug(f"Matching URI: {uri}")
                         return item
         
-        debug_print(f"No item found matching prefix: {target_prefix}")
+        logging.debug(f"No item found matching prefix: {target_prefix}")
         return None
     
     def get_field_value(self, item: Dict, field_path: str) -> Optional[str]:
         """Extract a field value from a Bitwarden item using dot notation path"""
-        debug_print(f"Looking for field '{field_path}' in item: {item.get('name', 'unnamed')}")
+        logging.debug(f"Looking for field '{field_path}' in item: {item.get('name', 'unnamed')}")
+        logging.debug(f"Item structure: {list(item.keys())}")
         
         # Check in custom fields first
         if 'fields' in item and item['fields']:
-            debug_print(f"Checking {len(item['fields'])} custom fields")
+            logging.debug(f"Checking {len(item['fields'])} custom fields")
             for field in item['fields']:
                 field_name = field.get('name')
-                debug_print(f"  - Field: {field_name}")
+                logging.debug(f"  - Field: {field_name} (type: {field.get('type', 'unknown')})")
                 if field_name == field_path:
-                    debug_print(f"Found matching field: {field_name}")
+                    logging.debug(f"Found matching field: {field_name}")
                     return field.get('value')
         
         # Check in login fields
         if 'login' in item and item['login']:
             login = item['login']
-            debug_print("Checking login fields")
+            logging.debug("Checking login fields")
+            logging.debug(f"Available login fields: {list(login.keys())}")
             if field_path == 'username' and 'username' in login:
-                debug_print("Found username in login fields")
+                logging.debug("Found username in login fields")
                 return login['username']
             elif field_path == 'password' and 'password' in login:
-                debug_print("Found password in login fields")
+                logging.debug("Found password in login fields")
                 return login['password']
         
-        debug_print(f"Field '{field_path}' not found in item")
+        logging.debug(f"Field '{field_path}' not found in item")
         return None
 
 
@@ -265,75 +293,81 @@ class EnvironmentProcessor:
     
     def scan_environment(self) -> Dict[str, str]:
         """Scan environment variables for op:// URIs"""
-        debug_print("Scanning environment variables for op:// URIs...")
+        logging.debug("Scanning environment variables for op:// URIs...")
         op_vars = {}
         total_vars = len(os.environ)
-        debug_print(f"Checking {total_vars} environment variables")
+        logging.debug(f"Checking {total_vars} environment variables")
         
         for key, value in os.environ.items():
             if URIParser.is_op_uri(value):
-                debug_print(f"Found op:// URI in {key}: {value}")
+                logging.debug(f"Found op:// URI in {key}: {value}")
                 op_vars[key] = value
         
-        debug_print(f"Found {len(op_vars)} environment variables with op:// URIs")
+        logging.debug(f"Found {len(op_vars)} environment variables with op:// URIs")
+        if op_vars:
+            logging.debug(f"Op URI variables: {list(op_vars.keys())}")
         return op_vars
     
     def resolve_uri(self, uri: str) -> str:
         """Resolve a single op:// URI to its secret value"""
-        debug_print(f"Resolving URI: {uri}")
+        logging.debug(f"Resolving URI: {uri}")
         parsed = URIParser.parse_uri(uri)
         if not parsed:
-            debug_print(f"Invalid URI format: {uri}")
+            logging.debug(f"Invalid URI format: {uri}")
             raise BWEnvError(f"Invalid URI format: {uri}")
         
         vault, item_name, field_path = parsed
-        debug_print(f"Parsed URI - Vault: {vault}, Item: {item_name}, Field: {field_path}")
+        logging.debug(f"Parsed URI - Vault: {vault}, Item: {item_name}, Field: {field_path}")
         
         # Find the Bitwarden item
         item = self.bw_client.find_item_by_uri_prefix(vault, item_name)
         if not item:
-            debug_print(f"No item found for op://{vault}/{item_name}")
+            logging.debug(f"No item found for op://{vault}/{item_name}")
             raise BWEnvError(f"No Bitwarden item found for URI: op://{vault}/{item_name}")
         
         # Get the field value
         value = self.bw_client.get_field_value(item, field_path)
         if value is None:
-            debug_print(f"Field '{field_path}' not found in item op://{vault}/{item_name}")
+            logging.debug(f"Field '{field_path}' not found in item op://{vault}/{item_name}")
             raise BWEnvError(f"Field '{field_path}' not found in item: op://{vault}/{item_name}")
         
-        debug_print(f"Successfully resolved URI {uri} to value (length: {len(value)} chars)")
+        logging.debug(f"Successfully resolved URI {uri} to value (length: {len(value)} chars)")
+        logging.debug(f"Value preview: {value[:50]}{'...' if len(value) > 50 else ''}")
         return value
     
     def create_resolved_environment(self) -> Dict[str, str]:
         """Create a new environment with all op:// URIs resolved"""
-        debug_print("Creating resolved environment...")
+        logging.debug("Creating resolved environment...")
+        logging.debug(f"Starting with {len(os.environ)} environment variables")
         new_env = os.environ.copy()
         op_vars = self.scan_environment()
         
         if not op_vars:
-            debug_print("No op:// URIs found in environment variables")
+            logging.debug("No op:// URIs found in environment variables")
             return new_env
         
-        debug_print(f"Resolving {len(op_vars)} op:// URIs...")
+        logging.debug(f"Resolving {len(op_vars)} op:// URIs...")
         for env_key, uri in op_vars.items():
             try:
-                debug_print(f"Processing {env_key}...")
+                logging.debug(f"Processing {env_key}...")
                 resolved_value = self.resolve_uri(uri)
                 new_env[env_key] = resolved_value
-                debug_print(f"Successfully resolved {env_key}")
+                logging.debug(f"Successfully resolved {env_key}")
             except BWEnvError as e:
-                debug_print(f"Failed to resolve {env_key}: {e}")
+                logging.debug(f"Failed to resolve {env_key}: {e}")
                 print(f"Error resolving {env_key}: {e}", file=sys.stderr)
                 sys.exit(1)
         
-        debug_print("Environment resolution completed")
+        logging.debug("Environment resolution completed")
+        logging.debug(f"Final environment has {len(new_env)} variables")
         return new_env
 
 
 def run_command(args: argparse.Namespace):
     """Run a command with resolved environment variables"""
-    debug_print(f"Running command: {' '.join(args.cmd_args)}")
-    debug_print(f"Sync enabled: {not args.no_sync}")
+    logging.debug(f"Running command: {' '.join(args.cmd_args)}")
+    logging.debug(f"Sync enabled: {not args.no_sync}")
+    logging.debug(f"Command arguments count: {len(args.cmd_args)}")
     
     bw_client = BitwardenClient(no_sync=args.no_sync)
     processor = EnvironmentProcessor(bw_client)
@@ -341,7 +375,9 @@ def run_command(args: argparse.Namespace):
     resolved_env = processor.create_resolved_environment()
     
     try:
-        debug_print(f"Executing command with {len(resolved_env)} environment variables")
+        logging.debug(f"Executing command with {len(resolved_env)} environment variables")
+        op_vars = processor.scan_environment()
+        logging.debug(f"Resolved variables with op:// URIs: {[k for k in resolved_env.keys() if k in op_vars]}")
         # Execute the command with the resolved environment
         result = subprocess.run(
             args.cmd_args,
@@ -350,31 +386,33 @@ def run_command(args: argparse.Namespace):
             stdout=sys.stdout,
             stderr=sys.stderr
         )
-        debug_print(f"Command completed with exit code: {result.returncode}")
+        logging.debug(f"Command completed with exit code: {result.returncode}")
         sys.exit(result.returncode)
     except KeyboardInterrupt:
-        debug_print("Command interrupted by user")
+        logging.debug("Command interrupted by user")
         sys.exit(130)
     except Exception as e:
-        debug_print(f"Exception during command execution: {e}")
+        logging.debug(f"Exception during command execution: {e}")
         print(f"Error executing command: {e}", file=sys.stderr)
         sys.exit(1)
 
 
 def read_secret(args: argparse.Namespace):
     """Read a specific secret value from a URI"""
-    debug_print(f"Reading secret from URI: {args.uri}")
-    debug_print(f"Sync enabled: {not args.no_sync}")
+    logging.debug(f"Reading secret from URI: {args.uri}")
+    logging.debug(f"Sync enabled: {not args.no_sync}")
+    logging.debug(f"URI validation: {URIParser.is_op_uri(args.uri)}")
     
     bw_client = BitwardenClient(no_sync=args.no_sync)
     processor = EnvironmentProcessor(bw_client)
     
     try:
         value = processor.resolve_uri(args.uri)
-        debug_print(f"Successfully retrieved secret (length: {len(value)} chars)")
+        logging.debug(f"Successfully retrieved secret (length: {len(value)} chars)")
+        logging.debug(f"Secret preview: {value[:20]}{'...' if len(value) > 20 else ''}")
         print(value)
     except BWEnvError as e:
-        debug_print(f"Failed to read secret: {e}")
+        logging.debug(f"Failed to read secret: {e}")
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -464,9 +502,14 @@ def main():
         sys.exit(1)
     
     # Set debug mode if requested (argparse will handle flag from either position)
-    if args.debug:
-        set_debug_mode(True)
-        debug_print("Debug mode enabled")
+    setup_logging(debug=args.debug if hasattr(args, 'debug') else False)
+    if hasattr(args, 'debug') and args.debug:
+        logging.debug("Debug mode enabled")
+        logging.debug(f"Command: {args.command}")
+        logging.debug(f"Arguments: {vars(args)}")
+        logging.debug(f"Python version: {sys.version}")
+        logging.debug(f"Working directory: {os.getcwd()}")
+        logging.debug(f"Environment variables containing 'BW': {[k for k in os.environ.keys() if 'BW' in k.upper()]}")
     
     if args.command == 'run':
         if not hasattr(args, 'cmd_args') or not args.cmd_args:

@@ -152,10 +152,30 @@ python -m unittest test_bwenv.py -v
 
 ### Debug Mode
 
-Use `--debug` flag to see detailed operation logs:
+Use `--debug` flag to see detailed operation logs with comprehensive debugging information:
 
 ```bash
 bwenv --debug read op://vault/item/field
+```
+
+Debug output includes:
+- **Command parsing**: Arguments, Python version, working directory
+- **Environment scanning**: Discovery of op:// URIs in environment variables
+- **Bitwarden CLI operations**: Command execution with timing and response details
+- **Authentication status**: BW_SESSION presence and authentication flow
+- **Item resolution**: Vault searches, item matching, and field lookups
+- **Performance metrics**: Sync timing and operation durations
+- **Value handling**: Safe previews of resolved secrets (truncated for security)
+
+Example debug output:
+```
+[DEBUG 15:55:14] Debug mode enabled
+[DEBUG 15:55:14] Command: run
+[DEBUG 15:55:14] BW_SESSION present: True
+[DEBUG 15:55:14] Found 2 environment variables with op:// URIs
+[DEBUG 15:55:15] Vault sync completed in 1.70 seconds
+[DEBUG 15:55:19] Found matching item: DEMO_DATA (ID: aaaaaaaa-1111-bbbb-2222-cccccccccccc)
+[DEBUG 15:55:19] Successfully resolved URI to value (length: 22 chars)
 ```
 
 ## License
@@ -199,3 +219,4 @@ This is a community project. For support:
 - **v1.3**: Consolidated into single file, improved error handling
 - **v1.4**: Default to sync on every run, rather than when specified
 - **v1.5**: Added `--` command separator to isolate bwenv flags from command flags. Both `./bwenv.py run echo "hello"` and `./bwenv.py run -- echo "hello"` work identically, but `./bwenv.py --no-sync run -- echo --debug "hello"` properly separates bwenv flags from command flags.
+- **v1.6**: Enhanced debug functionality with comprehensive logging including timestamps, command execution details, performance metrics, authentication status, item resolution tracking, and safe value previews.
