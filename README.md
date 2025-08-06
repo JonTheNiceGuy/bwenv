@@ -7,7 +7,7 @@ A cross-platform command-line tool that replaces environment variables containin
 - **Seamless Integration**: Works with any command or application that uses environment variables
 - **Secure**: Uses the official Bitwarden CLI for authentication and secret retrieval
 - **Cross-Platform**: Works on Windows, macOS, and Linux
-- **URI-Based**: Simple `op://vault/item/field` syntax for referencing secrets
+- **URI-Based**: Simple URI style syntax for referencing secrets (see below for details)
 - **Interactive Authentication**: Automatically prompts for master password when needed
 - **Flexible Flag Positions**: Global flags like `--debug` and `--no-sync` can be placed before or after subcommands
 - **Debug Support**: Built-in debug mode for troubleshooting
@@ -45,13 +45,28 @@ bwenv [--no-sync] read [--debug] <uri>
 bwenv read [--no-sync] [--debug] <uri>
 ```
 
-### URI Format
+### URI Formats
 
-Reference secrets using the format: `op://vault_name/item_name/field_name`
+Reference secrets using one of these supported formats:
 
-- `vault_name`: Name of your Bitwarden vault
+#### 1Password Compatible Format
+`op://vault_name/item_name/field_name`
+
+- `vault_name`: Name of your Bitwarden vault or organization
 - `item_name`: Name of the item containing the secret
 - `field_name`: Field name within the item (supports custom fields, `username`, `password`)
+
+#### Bitwarden Native Format
+`bw://vault_or_org/folder_or_collection/item_name/field_name`
+
+- `vault_or_org`: Vault name, organization name, or UUID
+- `folder_or_collection`: Folder name, collection name, or UUID (use "myvault" or "unassigned" for personal vault items)
+- `item_name`: Name of the item containing the secret
+- `field_name`: Field name within the item
+
+**Special identifiers:**
+- Use `myvault` or `unassigned` for personal vault items
+- UUIDs can be used instead of names for more precise targeting
 
 ### Examples
 
@@ -59,6 +74,7 @@ Reference secrets using the format: `op://vault_name/item_name/field_name`
 ```bash
 # Set environment variable with secret reference
 export DATABASE_PASSWORD="op://Production/database/password"
+export ACCOUNT_TOKEN="bw://myvault/CustomerA/ProjectB/Service Item/prod/token"
 
 # Run application with resolved secrets
 bwenv run python app.py
@@ -67,6 +83,7 @@ bwenv run python app.py
 #### Read a specific secret:
 ```bash
 bwenv read op://Production/api-keys/stripe_secret
+bwenv read "bw://example.org/collection1/service/username"
 ```
 
 #### Use debug mode:
@@ -100,7 +117,7 @@ bwenv --no-sync run python app.py --debug
 ```bash
 # Set multiple secret references
 export DB_USER="op://Production/database/username"
-export DB_PASS="op://Production/database/password"
+export DB_PASS="bw://Acme-Inc/DB Team/production db/password"
 export API_KEY="op://Production/api-keys/service_key"
 
 # Run with debug and skip sync for faster execution
@@ -232,3 +249,4 @@ This is a community project. For support:
 - **v1.5**: Added `--` command separator to isolate bwenv flags from command flags. Both `./bwenv.py run echo "hello"` and `./bwenv.py run -- echo "hello"` work identically, but `./bwenv.py --no-sync run -- echo --debug "hello"` properly separates bwenv flags from command flags.
 - **v1.6**: Enhanced debug functionality with comprehensive logging including timestamps, command execution details, performance metrics, authentication status, item resolution tracking, and safe value previews.
 - **v1.7**: Fixed argument parsing to ensure consistent behavior regardless of flag positions. All flag combinations (`--debug run`, `run --debug`, etc.) now work identically while properly respecting the `--` separator boundary.
+- **v1.8**: Added support for Bitwarden native URI format (`bw://`) alongside existing 1Password-compatible format (`op://`). The new format supports organization/collection paths, personal vault items, and UUID-based targeting for precise item resolution.

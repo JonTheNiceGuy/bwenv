@@ -79,6 +79,75 @@ class TestURIParser(unittest.TestCase):
         self.assertFalse(bwenv.URIParser.is_op_uri("not-a-uri"))
         self.assertFalse(bwenv.URIParser.is_op_uri("https://example.com"))
         self.assertFalse(bwenv.URIParser.is_op_uri("op://incomplete"))
+    
+    def test_valid_demo_data_uri(self):
+        """Test parsing Demo Data URI with spaces"""
+        uri = "op://Demo Data/demo/prod/plaintext"
+        result = bwenv.URIParser.parse_op_uri(uri)
+        self.assertEqual(result, ("Demo Data", "demo", "prod/plaintext"))
+    
+    def test_parse_bw_uri_valid(self):
+        """Test parsing valid bw:// URIs"""
+        # Basic bw:// URI
+        uri = "bw://myvault/Demo/Data/DEMO_DATA/username"
+        result = bwenv.URIParser.parse_bw_uri(uri)
+        self.assertEqual(result, uri)  # Should return the URI itself if valid
+        
+        # UUID format
+        uri = "bw://7e6ff908-4315-4377-9834-7154889cb4c8/28957e48-d900-4f14-a694-538bdb9654ce/DEMO_DATA/prod/plaintext"
+        result = bwenv.URIParser.parse_bw_uri(uri)
+        self.assertEqual(result, uri)  # Should return the URI itself if valid
+    
+    @unittest.skipUnless(os.environ.get('TEST_ORG_NAME'), "TEST_ORG_NAME environment variable not set")
+    def test_parse_bw_uri_with_org_name(self):
+        """Test parsing bw:// URIs with real org name from environment"""
+        org_name = os.environ.get('TEST_ORG_NAME')
+        uri = f"bw://{org_name}/Demo/Data/DEMO_DATA/password"
+        result = bwenv.URIParser.parse_bw_uri(uri)
+        self.assertEqual(result, uri)  # Should return the URI itself if valid
+    
+    def test_parse_bw_uri_invalid(self):
+        """Test parsing invalid bw:// URIs"""
+        # Missing parts
+        uri = "bw://myvault/Demo"
+        result = bwenv.URIParser.parse_bw_uri(uri)
+        self.assertIsNone(result)
+        
+        # Wrong scheme
+        uri = "op://myvault/Demo/Data/DEMO_DATA/username"
+        result = bwenv.URIParser.parse_bw_uri(uri)
+        self.assertIsNone(result)
+    
+    def test_is_bw_uri_valid(self):
+        """Test is_bw_uri with valid URIs"""
+        self.assertTrue(bwenv.URIParser.is_bw_uri("bw://myvault/Demo/Data/DEMO_DATA/username"))
+        self.assertTrue(bwenv.URIParser.is_bw_uri("bw://someorg/Demo/Data/DEMO_DATA/password"))
+    
+    def test_is_bw_uri_invalid(self):
+        """Test is_bw_uri with invalid URIs"""
+        self.assertFalse(bwenv.URIParser.is_bw_uri("not-a-uri"))
+        self.assertFalse(bwenv.URIParser.is_bw_uri("op://Employee/example/secret"))
+        self.assertFalse(bwenv.URIParser.is_bw_uri("bw://incomplete"))
+    
+    def test_is_supported_uri(self):
+        """Test is_supported_uri with various URI formats"""
+        # op:// URIs
+        self.assertTrue(bwenv.URIParser.is_supported_uri("op://Employee/example/secret"))
+        self.assertTrue(bwenv.URIParser.is_supported_uri("op://Demo Data/demo/prod/plaintext"))
+        
+        # bw:// URIs
+        self.assertTrue(bwenv.URIParser.is_supported_uri("bw://myvault/Demo/Data/DEMO_DATA/username"))
+        self.assertTrue(bwenv.URIParser.is_supported_uri("bw://someorg/Demo/Data/DEMO_DATA/password"))
+        
+        # Invalid URIs
+        self.assertFalse(bwenv.URIParser.is_supported_uri("not-a-uri"))
+        self.assertFalse(bwenv.URIParser.is_supported_uri("https://example.com"))
+    
+    def test_parse_uri_backward_compatibility(self):
+        """Test that parse_uri still works for backward compatibility"""
+        uri = "op://Employee/example/secret"
+        result = bwenv.URIParser.parse_uri(uri)
+        self.assertEqual(result, ("Employee", "example", "secret"))
 
 
 class TestBitwardenClient(unittest.TestCase):
@@ -133,18 +202,20 @@ class TestBitwardenClient(unittest.TestCase):
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_run_bw_command_success(self, mock_run):
         """Test successful Bitwarden CLI command execution"""
-        mock_run.return_value = Mock(stdout="test output", returncode=0)
+        # Mock both status call and actual command
+        mock_run.side_effect = [
+            Mock(stdout='{"status":"unlocked"}', returncode=0),  # bw status call
+            Mock(stdout="test output", returncode=0)  # actual command
+        ]
         
         client = bwenv.BitwardenClient()
         result = client._run_bw_command(['list', 'items'])
         
         self.assertEqual(result, "test output")
-        mock_run.assert_called_once_with(
-            ['bw', 'list', 'items'],
-            capture_output=True,
-            text=True,
-            check=True
-        )
+        # Should now make two calls: status validation + actual command
+        self.assertEqual(mock_run.call_count, 2)
+        mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
+        mock_run.assert_any_call(['bw', 'list', 'items'], capture_output=True, text=True, check=True)
     
     @patch('subprocess.run')
     def test_run_bw_command_failure(self, mock_run):
@@ -172,27 +243,74 @@ class TestBitwardenClient(unittest.TestCase):
         
         self.assertIn("not found", str(cm.exception))
     
+    @patch('subprocess.run')  
+    @patch.dict(os.environ, {'BW_SESSION': 'expired_session_token'})
+    def test_session_validation_clears_expired_session(self, mock_run):
+        """Test that session validation clears expired BW_SESSION"""
+        # Mock status call indicating unauthenticated (expired session)
+        mock_run.return_value = Mock(stdout='{"status":"unauthenticated"}', returncode=0)
+        
+        client = bwenv.BitwardenClient()
+        
+        # Just test the validation method directly
+        client._validate_session()
+        
+        # Verify that BW_SESSION was cleared during validation
+        self.assertNotIn('BW_SESSION', os.environ)
+    
+    @patch('subprocess.run')  
+    @patch.dict(os.environ, {'BW_SESSION': 'locked_session_token'})
+    def test_session_validation_unlocks_locked_vault(self, mock_run):
+        """Test that session validation unlocks a locked vault"""
+        # Mock status call indicating locked, then successful unlock
+        mock_run.side_effect = [
+            Mock(stdout='{"status":"locked"}', returncode=0),  # bw status call
+            Mock(stdout='new_session_token_123', returncode=0)  # bw unlock --raw call
+        ]
+        
+        client = bwenv.BitwardenClient()
+        
+        # Mock stdin to avoid interactive prompt in test
+        with patch('sys.stdin'):
+            client._validate_session()
+        
+        # Verify that BW_SESSION was updated with new token
+        self.assertEqual(os.environ.get('BW_SESSION'), 'new_session_token_123')
+    
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_sync_vault(self, mock_run):
         """Test vault synchronization"""
-        mock_run.return_value = Mock(stdout="Syncing complete.", returncode=0)
+        # Mock both status call and sync command
+        mock_run.side_effect = [
+            Mock(stdout='{"status":"unlocked"}', returncode=0),  # bw status call
+            Mock(stdout="Syncing complete.", returncode=0)  # bw sync call
+        ]
         
         client = bwenv.BitwardenClient()
         client.sync_vault()
         
-        mock_run.assert_called_once_with(
-            ['bw', 'sync'],
-            capture_output=True,
-            text=True,
-            check=True
-        )
+        # Should now make two calls: status validation + sync
+        self.assertEqual(mock_run.call_count, 2)
+        mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
+        mock_run.assert_any_call(['bw', 'sync'], capture_output=True, text=True, check=True)
     
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_get_items_with_op_uris(self, mock_run):
         """Test filtering items with op:// URIs"""
-        mock_run.return_value = Mock(stdout=json.dumps(self.sample_items), returncode=0)
+        # Use a function to determine return value based on command
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'sync']:
+                return Mock(stdout="Syncing complete.", returncode=0)
+            elif command == ['bw', 'list', 'items', '--search', 'op://']:
+                return Mock(stdout=json.dumps(self.sample_items), returncode=0)
+            else:
+                return Mock(stdout="", returncode=0)
+        
+        mock_run.side_effect = mock_command_response
         
         client = bwenv.BitwardenClient()
         items = client.get_items_with_op_uris()
@@ -206,13 +324,24 @@ class TestBitwardenClient(unittest.TestCase):
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_get_items_with_sync(self, mock_run):
         """Test getting items with sync enabled"""
-        mock_run.return_value = Mock(stdout=json.dumps(self.sample_items), returncode=0)
+        # Use a function to determine return value based on command
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'sync']:
+                return Mock(stdout="Syncing complete.", returncode=0)
+            elif command == ['bw', 'list', 'items', '--search', 'op://']:
+                return Mock(stdout=json.dumps(self.sample_items), returncode=0)
+            else:
+                return Mock(stdout="", returncode=0)
+        
+        mock_run.side_effect = mock_command_response
         
         client = bwenv.BitwardenClient(no_sync=False)
         items = client.get_items_with_op_uris()
         
-        # Should call sync first, then list items
-        self.assertEqual(mock_run.call_count, 2)
+        # Should call status validation, sync, then list items
+        mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
         mock_run.assert_any_call(['bw', 'sync'], capture_output=True, text=True, check=True)
         mock_run.assert_any_call(['bw', 'list', 'items', '--search', 'op://'], capture_output=True, text=True, check=True)
     
@@ -220,7 +349,18 @@ class TestBitwardenClient(unittest.TestCase):
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_find_item_by_uri_prefix(self, mock_run):
         """Test finding item by URI prefix"""
-        mock_run.return_value = Mock(stdout=json.dumps(self.sample_items), returncode=0)
+        # Use a function to determine return value based on command
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'sync']:
+                return Mock(stdout="Syncing complete.", returncode=0)
+            elif command == ['bw', 'list', 'items', '--search', 'op://']:
+                return Mock(stdout=json.dumps(self.sample_items), returncode=0)
+            else:
+                return Mock(stdout="", returncode=0)
+        
+        mock_run.side_effect = mock_command_response
         
         client = bwenv.BitwardenClient()
         
@@ -229,7 +369,7 @@ class TestBitwardenClient(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertEqual(item['id'], 'item1')
         
-        # Try to find non-existing item
+        # Try to find non-existing item - this uses the cache so shouldn't trigger more calls
         item = client.find_item_by_uri_prefix("NonExistent", "item")
         self.assertIsNone(item)
     
@@ -280,17 +420,21 @@ class TestEnvironmentProcessor(unittest.TestCase):
         'NORMAL_VAR': 'normal_value',
         'OP_VAR1': 'op://Employee/example/secret',
         'OP_VAR2': 'op://My Vault/My Item/api_key',
+        'BW_VAR1': 'bw://myvault/Demo/Data/DEMO_DATA/username',
+        'BW_VAR2': 'bw://someorg/Demo/Data/DEMO_DATA/password',
         'ANOTHER_NORMAL': 'another_value'
     }, clear=True)
     def test_scan_environment(self):
-        """Test scanning environment for op:// URIs"""
-        op_vars = self.processor.scan_environment()
+        """Test scanning environment for op:// and bw:// URIs"""
+        uri_vars = self.processor.scan_environment()
         
         expected = {
             'OP_VAR1': 'op://Employee/example/secret',
-            'OP_VAR2': 'op://My Vault/My Item/api_key'
+            'OP_VAR2': 'op://My Vault/My Item/api_key',
+            'BW_VAR1': 'bw://myvault/Demo/Data/DEMO_DATA/username',
+            'BW_VAR2': 'bw://someorg/Demo/Data/DEMO_DATA/password'
         }
-        self.assertEqual(op_vars, expected)
+        self.assertEqual(uri_vars, expected)
     
     def test_resolve_uri_success(self):
         """Test successful URI resolution"""
@@ -333,6 +477,26 @@ class TestEnvironmentProcessor(unittest.TestCase):
             self.processor.resolve_uri('op://Employee/example/secret')
         
         self.assertIn("Field 'secret' not found", str(cm.exception))
+    
+    def test_resolve_bw_uri_success(self):
+        """Test successful bw:// URI resolution"""
+        # Mock the resolve_bw_uri_to_value method
+        self.mock_client.resolve_bw_uri_to_value.return_value = 'resolved_bw_value'
+        
+        result = self.processor.resolve_uri('bw://myvault/Demo/Data/DEMO_DATA/username')
+        
+        self.assertEqual(result, 'resolved_bw_value')
+        self.mock_client.resolve_bw_uri_to_value.assert_called_once_with('bw://myvault/Demo/Data/DEMO_DATA/username')
+    
+    def test_resolve_bw_uri_item_not_found(self):
+        """Test bw:// URI resolution when item is not found"""
+        self.mock_client.resolve_bw_uri_to_value.side_effect = ValueError("No item found")
+        
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            self.processor.resolve_uri('bw://myvault/Demo/Data/DEMO_DATA/username')
+        
+        self.assertIn("Failed to resolve bw:// URI", str(cm.exception))
+    
     
     @patch.dict(os.environ, {
         'NORMAL_VAR': 'normal_value',
