@@ -717,5 +717,130 @@ class TestFunctional(unittest.TestCase):
         self.assertIn('subcommand_flags', result.stdout)
 
 
+class TestSendCommand(unittest.TestCase):
+    """Test cases for the send command functionality"""
+    
+    def setUp(self):
+        """Set up mocks for Bitwarden client"""
+        self.bw_client = bwenv.BitwardenClient(no_sync=True)
+    
+    def test_uri_has_field_op_uri(self):
+        """Test _uri_has_field method with op:// URI"""
+        # URI with field should return True
+        self.assertTrue(self.bw_client._uri_has_field("op://Employee/example/secret"))
+        
+        # URI with nested field should return True  
+        self.assertTrue(self.bw_client._uri_has_field("op://Employee/example/prod/token"))
+    
+    @patch.object(bwenv.BitwardenClient, 'resolve_bw_uri_to_value')
+    def test_uri_has_field_bw_uri(self, mock_resolve):
+        """Test _uri_has_field method with bw:// URI"""
+        # Mock successful resolution for field URI
+        mock_resolve.return_value = "some_value"
+        self.assertTrue(self.bw_client._uri_has_field("bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext"))
+        
+        # Mock failed resolution for item URI (no field)
+        mock_resolve.side_effect = Exception("No field")
+        self.assertFalse(self.bw_client._uri_has_field("bw://myvault/Demo/DEMO_DATA"))
+    
+    @patch.object(bwenv.BitwardenClient, '_create_bw_send_with_json')
+    def test_create_field_send(self, mock_create_send):
+        """Test creating a send for a specific field"""
+        mock_create_send.return_value = "https://send.bitwarden.com/test-url"
+        
+        # Mock the EnvironmentProcessor to return a test value
+        with patch.object(bwenv.EnvironmentProcessor, '_resolve_op_uri', return_value='test_secret_value'):
+            result = self.bw_client._create_field_send("op://Employee/example/secret", "Test Send")
+        
+        # Verify the send was created with correct JSON structure
+        mock_create_send.assert_called_once()
+        call_args = mock_create_send.call_args[0][0]
+        self.assertEqual(call_args['name'], 'Test Send')
+        self.assertEqual(call_args['text']['text'], 'test_secret_value')
+        self.assertEqual(call_args['type'], 0)
+        self.assertEqual(result, "https://send.bitwarden.com/test-url")
+    
+    @patch.object(bwenv.BitwardenClient, '_create_bw_send_with_json')
+    @patch.object(bwenv.BitwardenClient, '_find_item_from_uri')
+    def test_create_item_send(self, mock_find_item, mock_create_send):
+        """Test creating a send for a full item"""
+        mock_create_send.return_value = "https://send.bitwarden.com/test-item-url"
+        
+        # Mock item data
+        mock_item = {
+            'name': 'test-item',
+            'login': {
+                'username': 'test_user',
+                'password': 'test_pass'
+            },
+            'fields': [
+                {'name': 'api_key', 'value': 'secret_key_123'},
+                {'name': 'env', 'value': 'production'}
+            ]
+        }
+        mock_find_item.return_value = mock_item
+        
+        result = self.bw_client._create_item_send("op://Employee/example", "Item Send")
+        
+        # Verify the send was created with correct JSON structure
+        mock_create_send.assert_called_once()
+        call_args = mock_create_send.call_args[0][0]
+        self.assertEqual(call_args['name'], 'Item Send')
+        self.assertEqual(call_args['type'], 0)
+        
+        # Verify JSON content contains expected fields
+        json_content = call_args['text']['text']
+        parsed_json = json.loads(json_content)
+        self.assertEqual(parsed_json['username'], 'test_user')
+        self.assertEqual(parsed_json['password'], 'test_pass')
+        self.assertEqual(parsed_json['api_key'], 'secret_key_123')
+        self.assertEqual(parsed_json['env'], 'production')
+        
+        self.assertEqual(result, "https://send.bitwarden.com/test-item-url")
+    
+    @patch.object(bwenv.BitwardenClient, '_uri_has_field', return_value=True)
+    @patch.object(bwenv.BitwardenClient, '_create_field_send')
+    def test_send_item_with_field(self, mock_create_field, mock_has_field):
+        """Test send_item method when URI has a field"""
+        mock_create_field.return_value = "https://send.bitwarden.com/field-url"
+        
+        result = self.bw_client.send_item("op://Employee/example/secret", "Field Send")
+        
+        mock_create_field.assert_called_with("op://Employee/example/secret", "Field Send")
+        self.assertEqual(result, "https://send.bitwarden.com/field-url")
+    
+    @patch.object(bwenv.BitwardenClient, '_uri_has_field', return_value=False)
+    @patch.object(bwenv.BitwardenClient, '_create_item_send')
+    def test_send_item_without_field(self, mock_create_item, mock_has_field):
+        """Test send_item method when URI has no field"""
+        mock_create_item.return_value = "https://send.bitwarden.com/item-url"
+        
+        result = self.bw_client.send_item("bw://myvault/Demo/DEMO_DATA", "Item Send")
+        
+        mock_create_item.assert_called_with("bw://myvault/Demo/DEMO_DATA", "Item Send")
+        self.assertEqual(result, "https://send.bitwarden.com/item-url")
+
+
+class TestSendCommandIntegration(unittest.TestCase):
+    """Integration tests for send command"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.test_script = ['python', os.path.join(os.path.dirname(__file__), 'bwenv.py')]
+    
+    def test_send_command_help(self):
+        """Test send command help"""
+        result = subprocess.run(self.test_script + ['send', '--help'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("URI(s) to send", result.stdout)
+        self.assertIn("--name", result.stdout)
+    
+    def test_send_command_no_uri(self):
+        """Test send command without URI"""
+        result = subprocess.run(self.test_script + ['send'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("required", result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

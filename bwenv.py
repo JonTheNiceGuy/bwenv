@@ -6,8 +6,9 @@ A cross-platform tool to replace environment variables containing Bitwarden secr
 with actual secret values using the Bitwarden CLI.
 
 Usage:
-    bwenv run [--no-sync] <command> [args...]
-    bwenv read [--no-sync] <uri>
+    bwenv run [--no-sync] [--debug] <command> [args...]
+    bwenv read [--no-sync] [--debug] <uri>
+    bwenv send [--no-sync] [--debug] [--name <title>] <uri>
 
 Examples:
     bwenv run sh
@@ -636,10 +637,10 @@ class BitwardenClient:
         logging.debug(f"Found {len(candidate_items)} items matching organization constraint")
         
         # Try different splits of parts to find item_name + field_name
-        # Work backwards: last part is always field, second-to-last might be item name
-        for split_point in range(1, len(parts)):  # Try different split points
+        # Work backwards: last part could be field, second-to-last might be item name
+        for split_point in range(1, len(parts) + 1):  # Try different split points, including full length
             potential_item_name = parts[split_point - 1]
-            potential_field_name = '/'.join(parts[split_point:])
+            potential_field_name = '/'.join(parts[split_point:]) if split_point < len(parts) else ""
             
             logging.debug(f"Trying item_name='{potential_item_name}', field_name='{potential_field_name}'")
             
@@ -648,15 +649,220 @@ class BitwardenClient:
                 if item.get('name') == potential_item_name:
                     logging.debug(f"Found potential item match: {potential_item_name}")
                     
-                    # Check if this item has the field
-                    if self.get_field_value(item, potential_field_name) is not None:
-                        logging.debug(f"Item has field '{potential_field_name}' - match found!")
-                        return item, potential_field_name
+                    if potential_field_name:
+                        # Check if this item has the field
+                        if self.get_field_value(item, potential_field_name) is not None:
+                            logging.debug(f"Item has field '{potential_field_name}' - match found!")
+                            return item, potential_field_name
+                        else:
+                            logging.debug(f"Item does not have field '{potential_field_name}' - continuing search")
                     else:
-                        logging.debug(f"Item does not have field '{potential_field_name}' - continuing search")
+                        # No field name - this is an item-only match
+                        logging.debug(f"Item match without field - returning item")
+                        return item, ""
         
         logging.debug("No matching item found")
         return None, ""
+    
+    def send_item(self, uri: str, custom_name: Optional[str] = None) -> str:
+        """Create a Bitwarden Send with item data or specific field"""
+        logging.debug(f"Creating send for URI: {uri}")
+        logging.debug(f"Custom name: {custom_name}")
+        
+        # Determine if this is a full item or specific field
+        is_op_uri = URIParser.is_op_uri(uri)
+        is_bw_uri = URIParser.is_bw_uri(uri)
+        
+        if not (is_op_uri or is_bw_uri):
+            raise BWEnvError(f"Invalid URI format: {uri}")
+        
+        # Check if URI points to a specific field
+        has_field = self._uri_has_field(uri)
+        
+        if has_field:
+            # Single field send
+            return self._create_field_send(uri, custom_name)
+        else:
+            # Full item send
+            return self._create_item_send(uri, custom_name)
+    
+    def _uri_has_field(self, uri: str) -> bool:
+        """Check if URI points to a specific field"""
+        if URIParser.is_op_uri(uri):
+            parsed = URIParser.parse_op_uri(uri)
+            if parsed:
+                vault, item, field_path = parsed
+                # If field_path exists, it's a field reference
+                return bool(field_path.strip())
+        elif URIParser.is_bw_uri(uri):
+            # For bw:// URIs, try to actually resolve to see if it's a field or item
+            try:
+                # Try to resolve as if it has a field - if this succeeds, it's a field URI
+                self.resolve_bw_uri_to_value(uri)
+                return True
+            except:
+                # If resolution fails, assume it's an item URI (no field)
+                return False
+        return False
+    
+    def _create_field_send(self, uri: str, custom_name: Optional[str]) -> str:
+        """Create a send with a specific field value"""
+        logging.debug(f"Creating field send for: {uri}")
+        
+        # Resolve the field value
+        if URIParser.is_op_uri(uri):
+            processor = EnvironmentProcessor(self)
+            value = processor._resolve_op_uri(uri)
+        else:
+            value = self.resolve_bw_uri_to_value(uri)
+        
+        # Set the title
+        title = custom_name if custom_name else uri
+        
+        # Create send using encoded JSON approach
+        import datetime
+        # Set deletion date to 1 day from now
+        deletion_date = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+        
+        send_data = {
+            "object": "send",
+            "type": 0,  # Text send
+            "name": title,
+            "text": {
+                "text": value,
+                "hidden": False
+            },
+            "file": None,
+            "maxAccessCount": None,
+            "deletionDate": deletion_date,
+            "expirationDate": None,
+            "password": None,
+            "disabled": False,
+            "hideEmail": False
+        }
+        
+        return self._create_bw_send_with_json(send_data)
+    
+    def _create_item_send(self, uri: str, custom_name: Optional[str]) -> str:
+        """Create a send with full item data as JSON"""
+        logging.debug(f"Creating item send for: {uri}")
+        
+        # Find the item
+        item = self._find_item_from_uri(uri)
+        if not item:
+            raise BWEnvError(f"No item found for URI: {uri}")
+        
+        # Create JSON representation of relevant fields
+        item_data = {}
+        
+        # Add login fields
+        if 'login' in item and item['login']:
+            login = item['login']
+            if 'username' in login and login['username']:
+                item_data['username'] = login['username']
+            if 'password' in login and login['password']:
+                item_data['password'] = login['password']
+        
+        # Add custom fields
+        if 'fields' in item and item['fields']:
+            for field in item['fields']:
+                if field.get('name') and field.get('value'):
+                    item_data[field['name']] = field['value']
+        
+        # Convert to JSON
+        json_data = json.dumps(item_data, indent=2)
+        
+        # Set the title
+        title = custom_name if custom_name else uri
+        
+        # Create send using encoded JSON approach
+        import datetime
+        # Set deletion date to 1 day from now
+        deletion_date = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+        
+        send_data = {
+            "object": "send",
+            "type": 0,  # Text send
+            "name": title,
+            "text": {
+                "text": json_data,
+                "hidden": False
+            },
+            "file": None,
+            "maxAccessCount": None,
+            "deletionDate": deletion_date,
+            "expirationDate": None,
+            "password": None,
+            "disabled": False,
+            "hideEmail": False
+        }
+        
+        return self._create_bw_send_with_json(send_data)
+    
+    def _find_item_from_uri(self, uri: str) -> Optional[Dict]:
+        """Find item from either op:// or bw:// URI"""
+        if URIParser.is_op_uri(uri):
+            parsed = URIParser.parse_op_uri(uri)
+            if parsed:
+                vault, item_name, _ = parsed
+                return self.find_item_by_uri_prefix(vault, item_name)
+        elif URIParser.is_bw_uri(uri):
+            # Parse bw:// URI to find item
+            path_part = uri[5:]  # Remove bw://
+            parts = path_part.split('/')
+            if len(parts) >= 3:
+                org_or_vault = parts[0]
+                # Use the unified logic to find item (with or without field)
+                remaining_parts = parts[1:]
+                
+                org_id = self._resolve_organization(org_or_vault)
+                item, field_name = self._find_item_with_field_from_parts(org_id, remaining_parts)
+                # For item lookup, we want the case where field_name is empty
+                if item and not field_name:
+                    return item
+                else:
+                    return None
+        
+        return None
+    
+    def _create_bw_send_with_json(self, send_data: Dict) -> str:
+        """Create a Bitwarden Send using encoded JSON"""
+        logging.debug(f"Creating Bitwarden Send with JSON data: {send_data}")
+        
+        import subprocess
+        import json
+        
+        # Convert to JSON and encode
+        json_str = json.dumps(send_data)
+        logging.debug(f"Send JSON: {json_str}")
+        
+        # Use bw encode to create encoded JSON
+        encode_result = subprocess.run(
+            ['bw', 'encode'], 
+            input=json_str, 
+            capture_output=True, 
+            text=True, 
+            check=True
+        )
+        encoded_json = encode_result.stdout.strip()
+        logging.debug(f"Encoded JSON: {encoded_json}")
+        
+        # Create the send with encoded JSON
+        result = self._run_bw_command(['send', 'create', encoded_json])
+        logging.debug(f"Send creation result: {result}")
+        
+        # Parse result and extract access URL
+        try:
+            send_info = json.loads(result)
+            access_url = send_info.get('accessUrl', '')
+            if access_url:
+                return access_url
+            else:
+                # Fallback to full result if no access URL found
+                return result.strip()
+        except json.JSONDecodeError:
+            # Fallback to full result if parsing fails
+            return result.strip()
 
 
 class EnvironmentProcessor:
@@ -821,6 +1027,41 @@ def read_secret(args: argparse.Namespace):
         sys.exit(1)
 
 
+def send_item(args: argparse.Namespace):
+    """Create a Bitwarden Send from a URI"""
+    logging.debug(f"Creating send from URI(s): {args.uri}")
+    logging.debug(f"Custom name: {getattr(args, 'name', None)}")
+    logging.debug(f"Sync enabled: {not args.no_sync}")
+    
+    bw_client = BitwardenClient(no_sync=args.no_sync)
+    
+    try:
+        custom_name = getattr(args, 'name', None)
+        multiple_uris = len(args.uri) > 1
+        for item in args.uri:
+            logging.debug(f"URI validation - op://: {URIParser.is_op_uri(item)}, bw://: {URIParser.is_bw_uri(item)}")
+
+            if custom_name:
+                name = custom_name
+                if multiple_uris:
+                    name = f'{name} - {item}'
+            else:
+                name = None
+
+            send_url = bw_client.send_item(item, name)
+            logging.debug(f"Successfully created send: {send_url}")
+
+            result = send_url
+            if multiple_uris:
+                result = f'{item} - {result}'
+
+            print(result)
+    except BWEnvError as e:
+        logging.debug(f"Failed to create send: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def parse_args_with_separator():
     """Parse arguments handling the '--' separator for command isolation"""
     argv = sys.argv[1:]  # Skip script name
@@ -862,7 +1103,7 @@ def parse_args_with_separator():
             debug = True
         elif i < flag_extraction_limit and arg == '--no-sync':
             no_sync = True
-        elif arg in ['run', 'read']:
+        elif arg in ['run', 'read', 'send']:
             command = arg
             if command == 'run':
                 run_idx = len(filtered_argv)  # Position in filtered argv
@@ -910,6 +1151,11 @@ def parse_args_with_separator():
     read_parser = subparsers.add_parser('read', help='Read a specific secret value')
     read_parser.add_argument('uri', help='URI to read (e.g., op://Employee/example/secret)')
     
+    # Send command
+    send_parser = subparsers.add_parser('send', help='Create a Bitwarden Send from a URI')
+    send_parser.add_argument('uri', help='URI(s) to send (e.g., op://Employee/example/secret or bw://MyOrg/Collection/Path/item/custom/field)', nargs="+")
+    send_parser.add_argument('--name', help='Custom name for the send')
+    
     args = parser.parse_args(bwenv_args)
     
     # Set the manually parsed flags
@@ -938,6 +1184,7 @@ def main():
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
         run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
         read_parser = subparsers.add_parser('read', help='Read a specific secret value')
+        send_parser = subparsers.add_parser('send', help='Create a Bitwarden Send from a URI')
         parser.print_help()
         sys.exit(1)
     
@@ -958,6 +1205,8 @@ def main():
         run_command(args)
     elif args.command == 'read':
         read_secret(args)
+    elif args.command == 'send':
+        send_item(args)
     else:
         # Show help and exit
         parser = argparse.ArgumentParser(
@@ -970,6 +1219,7 @@ def main():
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
         run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
         read_parser = subparsers.add_parser('read', help='Read a specific secret value')
+        send_parser = subparsers.add_parser('send', help='Create a Bitwarden Send from a URI')
         parser.print_help()
         sys.exit(1)
 
