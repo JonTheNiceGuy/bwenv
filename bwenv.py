@@ -113,8 +113,9 @@ class BitwardenClient:
     
     def __init__(self, no_sync: bool = False):
         self.sync = not no_sync
-        self._items_cache = None
-    
+        self._op_items_cache = None
+        self._bw_items_cache = None
+
     def _run_bw_command(self, args: List[str]) -> str:
         """Run a Bitwarden CLI command and return stdout"""
         command = ['bw'] + args
@@ -326,9 +327,9 @@ class BitwardenClient:
     
     def get_items_with_op_uris(self) -> List[Dict]:
         """Get all Bitwarden items that have URIs starting with 'op://'"""
-        if self._items_cache is not None:
-            logging.debug(f"Using cached items ({len(self._items_cache)} items)")
-            return self._items_cache
+        if self._op_items_cache is not None:
+            logging.debug(f"Using cached items ({len(self._op_items_cache)} items)")
+            return self._op_items_cache
         
         logging.debug("Fetching Bitwarden items with op:// URIs...")
         
@@ -352,7 +353,7 @@ class BitwardenClient:
                         break
         
         logging.debug(f"Filtered to {len(op_items)} items with op:// URIs")
-        self._items_cache = op_items
+        self._op_items_cache = op_items
         return op_items
     
     def find_item_by_uri_prefix(self, vault: str, item_name: str) -> Optional[Dict]:
@@ -623,14 +624,14 @@ class BitwardenClient:
             self.sync_vault()
 
         # Get all items
-        if self._items_cache is not None:
-            logging.debug(f"Using cached items ({len(self._items_cache)} items)")
-            items = self._items_cache
+        if self._bw_items_cache is not None:
+            logging.debug(f"Using cached items ({len(self._bw_items_cache)} items)")
+            items = self._bw_items_cache
         else:
             items_json = self._run_bw_command(['list', 'items'])
             items = json.loads(items_json)
             logging.debug(f"Found {len(items)} total items to search")
-            self._items_cache = items
+            self._bw_items_cache = items
 
         # Filter items by organization first
         candidate_items = []
