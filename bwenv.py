@@ -621,12 +621,17 @@ class BitwardenClient:
         
         if self.sync:
             self.sync_vault()
-        
+
         # Get all items
-        items_json = self._run_bw_command(['list', 'items'])
-        items = json.loads(items_json)
-        logging.debug(f"Found {len(items)} total items to search")
-        
+        if self._items_cache is not None:
+            logging.debug(f"Using cached items ({len(self._items_cache)} items)")
+            items = self._items_cache
+        else:
+            items_json = self._run_bw_command(['list', 'items'])
+            items = json.loads(items_json)
+            logging.debug(f"Found {len(items)} total items to search")
+            self._items_cache = items
+
         # Filter items by organization first
         candidate_items = []
         for item in items:
