@@ -103,6 +103,44 @@ class VaultResolverTests(unittest.TestCase):
             "custom-token", self.resolver().resolve("bw://Infra/service/token")
         )
 
+    def test_bw_uri_supports_standard_login_and_notes_fields(self):
+        resolver = self.resolver()
+        self.assertEqual("login-user", resolver.resolve("bw://Infra/service/username"))
+        self.assertEqual("login-password", resolver.resolve("bw://Infra/service/password"))
+        self.assertEqual("notes-value", resolver.resolve("bw://Infra/service/notes"))
+
+    def test_bw_uri_uri_metadata_is_a_fallback_only(self):
+        resolver = self.resolver(
+            organizations=[],
+            items=[
+                item(
+                    "renamed-item",
+                    "other-org",
+                    fields=[{"name": "token", "value": "fallback-token"}],
+                    uris=[{"uri": "op://Infra/service"}],
+                )
+            ],
+        )
+        self.assertEqual("fallback-token", resolver.resolve("bw://Infra/service/token"))
+
+    def test_bw_uri_rejects_references_op_uri_would_reject(self):
+        resolver = self.resolver()
+        for invalid in ("bw://Infra/service", "bw://Infra", "bw:///service/token"):
+            with self.subTest(uri=invalid):
+                with self.assertRaises(bwenv.ResolutionError):
+                    resolver.resolve(invalid)
+
+    def test_bw_uri_parses_exactly_like_op_uri(self):
+        for uri in (
+            "bw://Infra/service/token",
+            "bw://Infra/service/nested/field",
+            "bw://Infra/service.user/token",
+        ):
+            with self.subTest(uri=uri):
+                self.assertIsNotNone(bwenv.URIParser.parse_bw_uri(uri))
+                expected = bwenv.URIParser.parse_op_uri("op://" + uri.removeprefix("bw://"))
+                self.assertIsNotNone(expected)
+
     def test_missing_bw_fails_without_raw_process_details(self):
         with patch.object(bwenv.subprocess, "run", side_effect=FileNotFoundError):
             with self.assertRaisesRegex(bwenv.BWEnvError, "was not found") as raised:
@@ -156,6 +194,13 @@ class InjectTests(unittest.TestCase):
     def test_template_supports_bare_and_braced_references(self):
         rendered = bwenv.render_template(
             "a={{ op://Infra/service/token }}\nb=op://Infra/service/password\n",
+            self.resolver,
+        )
+        self.assertEqual("a=custom-token\nb=login-password\n", rendered)
+
+    def test_template_supports_bw_references(self):
+        rendered = bwenv.render_template(
+            "a={{ bw://Infra/service/token }}\nb=bw://Infra/service/password\n",
             self.resolver,
         )
         self.assertEqual("a=custom-token\nb=login-password\n", rendered)
@@ -374,7 +419,7 @@ class InstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("bwenv 2.0.0\n", result.stdout)
+            self.assertEqual("bwenv 2.1.0\n", result.stdout)
             source.unlink()
             result = subprocess.run(
                 [str(installed), "--version"],

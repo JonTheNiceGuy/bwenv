@@ -43,38 +43,43 @@ a background process.
 
 ## Reference resolution
 
-The supported compatibility form is:
+The native form is:
+
+```text
+bw://<organisation>/<item>/<champ>
+```
+
+The 1Password compatibility form stays supported and resolves identically:
 
 ```text
 op://<organisation>/<item>/<champ>
 ```
 
-`bwenv` finds the exact Vaultwarden organisation, then the exact item name,
-then an exact custom field. Custom fields take precedence over `username`,
-`password`, `notes`, and `note`.
+Both forms share one parser and one resolution path. `bwenv` finds the exact
+Vaultwarden organisation, then the exact item name, then an exact custom field.
+Custom fields take precedence over `username`, `password`, `notes`, and
+`note`.
 
 For migrations, an item may instead contain the original `op://organisation/item`
 or full `op://organisation/item/champ` in a Bitwarden login URI. This URI
-lookup is only used after direct lookup fails. Missing and ambiguous matches
-always fail; no value is guessed.
-
-The legacy `bw://organisation/item/champ` form remains available for simple
-references. It is not the compatibility contract of this fork.
+lookup is only used after direct lookup fails, for `op://` and `bw://`
+references alike. Missing and ambiguous matches always fail; no value is
+guessed.
 
 ## Commands
 
 ```sh
 # Print one value to stdout.
-python3 bwenv.py read op://Infra/service/token
+python3 bwenv.py read bw://Infra/service/token
 
-# Resolve environment variables whose entire value is op://... or bw://... .
-TOKEN=op://Infra/service/token python3 bwenv.py run -- ./service
+# Resolve environment variables whose entire value is bw://... or op://... .
+TOKEN=bw://Infra/service/token python3 bwenv.py run -- ./service
 
-# Read an op-compatible env file before starting the child.
+# Read an env file before starting the child.
 bwenv run --env-file .env -- ./service
 
-# Inject braced or bare op:// references from stdin to stdout.
-printf 'token={{ op://Infra/service/token }}\n' | python3 bwenv.py inject
+# Inject braced or bare bw:// (or op://) references from stdin to stdout.
+printf 'token={{ bw://Infra/service/token }}\n' | python3 bwenv.py inject
 
 # Render a file atomically. Existing output requires --force when noninteractive.
 python3 bwenv.py inject -i runtime.env.tpl -o runtime.env --file-mode 0600 --force

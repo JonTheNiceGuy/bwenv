@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # bwenv managed install v1
-"""Resolve Bitwarden/Vaultwarden secrets from 1Password-compatible references.
+"""Resolve Bitwarden/Vaultwarden secrets from bw:// and op:// references.
 
-The public compatibility contract is ``op://organisation/item/field``. This
-tool delegates authentication and vault access to the official ``bw`` CLI.
+The native reference form is ``bw://organisation/item/field``. The historical
+``op://organisation/item/field`` compatibility contract stays supported and
+resolves identically, including the login-URI fallback. This tool delegates
+authentication and vault access to the official ``bw`` CLI.
 """
 
 from __future__ import annotations
@@ -24,13 +26,14 @@ from typing import Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 URI_MATCH_EXACT = 3
 OP_URI_PATTERN = re.compile(r"^op://([^/]+)/([^/]+)/(.+)$")
 ENV_FILE_LINE_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+SECRET_REFERENCE_SCHEME = r"(?:op|bw)://"
 TEMPLATE_REFERENCE_PATTERN = re.compile(
-    r"\{\{\s*(op://[^\s{}]+)\s*\}\}|(?<![A-Za-z0-9_])"
-    r"(op://[A-Za-z0-9._~-]+/[A-Za-z0-9._~-]+/[A-Za-z0-9._~/%-]+)"
+    r"\{\{\s*(" + SECRET_REFERENCE_SCHEME + r"[^\s{}]+)\s*\}\}|(?<![A-Za-z0-9_])"
+    r"(" + SECRET_REFERENCE_SCHEME + r"[A-Za-z0-9._~-]+/[A-Za-z0-9._~-]+/[A-Za-z0-9._~/%-]+)"
 )
 KEYCHAIN_ACCOUNT = "BW_SESSION"
 
@@ -127,6 +130,11 @@ def import_marker(plan_digest: str, organization: str, item_name: str) -> str:
     )
 
 
+def _bw_uri_as_op(uri: str) -> str:
+    """Map ``bw://organisation/item/champ`` onto the op:// compatibility contract."""
+    return "op://" + uri.removeprefix("bw://")
+
+
 class URIParser:
     """Compatibility parser retained for callers that imported the old module."""
 
@@ -139,8 +147,7 @@ class URIParser:
     def parse_bw_uri(uri: str) -> str | None:
         if not uri.startswith("bw://"):
             return None
-        parts = uri.removeprefix("bw://").split("/")
-        return uri if len(parts) >= 3 and all(parts) else None
+        return uri if URIParser.parse_op_uri(_bw_uri_as_op(uri)) is not None else None
 
     @classmethod
     def parse_uri(cls, uri: str) -> tuple[str, str, str] | None:
@@ -309,16 +316,10 @@ class VaultResolver:
         return self._field(item, reference)
 
     def resolve_bw_uri(self, uri: str) -> str:
-        """Retain the simple historical ``bw://org/item/field`` form."""
+        """Resolve ``bw://`` exactly like the op:// contract, URI fallback included."""
         if URIParser.parse_bw_uri(uri) is None:
             raise ResolutionError(f"invalid bw:// reference: {uri}")
-        parts = uri.removeprefix("bw://").split("/")
-        organization, item_name, field = parts[0], parts[-2], parts[-1]
-        reference = OpReference(organization, item_name, field)
-        item = self._direct_item(reference)
-        if item is None:
-            raise ResolutionError(f"missing item for bw://{organization}/{item_name}")
-        return self._field(item, reference)
+        return self.resolve_op_uri(_bw_uri_as_op(uri))
 
     def resolve(self, uri: str) -> str:
         if URIParser.is_op_uri(uri):
@@ -347,7 +348,7 @@ class EnvironmentProcessor:
 
 
 def render_template(content: str, resolver: VaultResolver) -> str:
-    """Replace braced and bare op:// references, failing on the first missing one."""
+    """Replace braced and bare op:// and bw:// references, failing on the first missing one."""
     def replace(match: re.Match[str]) -> str:
         return resolver.resolve(match.group(1) or match.group(2))
     return TEMPLATE_REFERENCE_PATTERN.sub(replace, content)
@@ -1004,7 +1005,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run a command with resolved environment variables")
     run.add_argument("--env-file", type=Path)
     run.add_argument("command_args", nargs=argparse.REMAINDER)
-    inject = commands.add_parser("inject", help="inject op:// references into a template")
+    inject = commands.add_parser("inject", help="inject op:// and bw:// references into a template")
     inject.add_argument("-i", "--in-file", type=Path)
     inject.add_argument("-o", "--out-file", type=Path)
     inject.add_argument("--file-mode", type=parse_file_mode, default=0o600)
