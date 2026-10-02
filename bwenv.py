@@ -284,21 +284,29 @@ class BitwardenClient:
         return op_items
     
     def find_item_by_uri_prefix(self, vault: str, item_name: str) -> Optional[Dict]:
-        """Find a Bitwarden item by matching op://vault/item prefix"""
-        target_prefix = f"op://{vault}/{item_name}"
-        logging.debug(f"Searching for item with prefix: {target_prefix}")
+        """Find the one Bitwarden item whose website URI is op://vault/item.
         
-        items = self.get_items_with_op_uris()
-        for item in items:
-            if 'login' in item and item['login'] and 'uris' in item['login']:
-                for uri_obj in item['login']['uris']:
-                    uri = uri_obj.get('uri', '')
-                    if uri.startswith(target_prefix):
-                        logging.debug(f"Found matching item: {item.get('name', 'unnamed')} (ID: {item.get('id', 'unknown')})")
-                        logging.debug(f"Matching URI: {uri}")
-                        return item
+        The URI must match exactly (a trailing slash is allowed): op://Prod/db is not op://Prod/db-prod.
+        Two different items carrying the same reference is an error rather than a guess, since an item
+        shared into any collection you can read could otherwise shadow yours.
+        """
+        target = f"op://{vault}/{item_name}"
+        logging.debug(f"Searching for item with URI: {target}")
         
-        logging.debug(f"No item found matching prefix: {target_prefix}")
+        matches = []
+        for item in self.get_items_with_op_uris():
+            uris = (item.get('login') or {}).get('uris') or []
+            if any((uri_obj.get('uri') or '').rstrip('/') == target for uri_obj in uris):
+                if all(item.get('id') != match.get('id') for match in matches):
+                    matches.append(item)
+        
+        if len(matches) > 1:
+            raise BWEnvError(f"{len(matches)} Bitwarden items have the URI {target}; keep it on exactly one item")
+        if matches:
+            logging.debug(f"Found matching item: {matches[0].get('name', 'unnamed')} (ID: {matches[0].get('id', 'unknown')})")
+            return matches[0]
+        
+        logging.debug(f"No item found with URI: {target}")
         return None
     
     def get_field_value(self, item: Dict, field_path: str) -> Optional[str]:
@@ -342,30 +350,23 @@ class BitwardenClient:
             logging.debug(f"'{org_or_vault}' appears to be a UUID")
             return org_or_vault
         
-        try:
-            # List organizations to resolve name to UUID
-            if self._organizations_cache is not None:
-                logging.debug(f"Using cached organizations ({len(self._organizations_cache)} organizations)")
-                organizations = self._organizations_cache
-            else:
-                orgs_json = self._run_bw_command(['list', 'organizations'])
-                organizations = json.loads(orgs_json)
-                logging.debug(f"Found {len(organizations)} organizations")
-                self._organizations_cache = organizations
-            
-            for org in organizations:
-                if org.get('name') == org_or_vault:
-                    org_id = org.get('id')
-                    logging.debug(f"Resolved organization '{org_or_vault}' to ID: {org_id}")
-                    return org_id
-            
-            # If not found by name, maybe it's still a UUID we don't recognize
-            logging.debug(f"Organization '{org_or_vault}' not found by name, treating as UUID")
-            return org_or_vault
-            
-        except Exception as e:
-            logging.debug(f"Failed to list organizations: {e}")
-            return org_or_vault
+        # List organizations to resolve name to UUID; a failure to list them is a real error
+        if self._organizations_cache is not None:
+            logging.debug(f"Using cached organizations ({len(self._organizations_cache)} organizations)")
+            organizations = self._organizations_cache
+        else:
+            orgs_json = self._run_bw_command(['list', 'organizations'])
+            organizations = json.loads(orgs_json)
+            logging.debug(f"Found {len(organizations)} organizations")
+            self._organizations_cache = organizations
+        
+        for org in organizations:
+            if org.get('name') == org_or_vault:
+                org_id = org.get('id')
+                logging.debug(f"Resolved organization '{org_or_vault}' to ID: {org_id}")
+                return org_id
+        
+        raise BWEnvError(f"Organization '{org_or_vault}' not found (use its name or UUID, or 'myvault' for your own vault)")
     
     def _get_folders(self) -> List[Dict]:
         """Get all personal vault folders, cached for the life of the client"""

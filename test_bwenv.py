@@ -680,6 +680,76 @@ class TestBwUriPathResolution(unittest.TestCase):
 
 
 
+class TestOpUriMatching(unittest.TestCase):
+    """op:// references must name exactly one item"""
+
+    @staticmethod
+    def _item(item_id, uri, password):
+        return {"id": item_id, "name": item_id, "organizationId": None,
+                "login": {"password": password, "uris": [{"uri": uri}]}, "fields": []}
+
+    def _client(self, items):
+        patcher = patch('subprocess.run', side_effect=fake_bw({('bw', 'list', 'items'): json.dumps(items)}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        return bwenv.BitwardenClient(no_sync=True)
+
+    def test_item_name_prefix_does_not_match(self):
+        """op://Prod/db must not resolve to the item op://Prod/db-prod, even if that is listed first"""
+        client = self._client([self._item('db-prod', 'op://Prod/db-prod', 'WRONG'),
+                               self._item('db', 'op://Prod/db', 'RIGHT')])
+
+        self.assertEqual(client.find_item_by_uri_prefix('Prod', 'db')['id'], 'db')
+
+    def test_only_a_prefix_match_is_not_found(self):
+        """With only op://Prod/db-prod present, op://Prod/db is not found"""
+        client = self._client([self._item('db-prod', 'op://Prod/db-prod', 'WRONG')])
+
+        self.assertIsNone(client.find_item_by_uri_prefix('Prod', 'db'))
+
+    def test_two_items_with_the_same_reference_is_an_error(self):
+        """Another item (e.g. shared into an org collection) cannot silently shadow yours"""
+        client = self._client([self._item('mine', 'op://Prod/db', 'MINE'),
+                               self._item('theirs', 'op://Prod/db', 'THEIRS')])
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            client.find_item_by_uri_prefix('Prod', 'db')
+        self.assertIn('op://Prod/db', str(cm.exception))
+
+    def test_same_item_listing_the_reference_twice_is_fine(self):
+        """One item carrying the URI twice is still one item"""
+        item = self._item('db', 'op://Prod/db', 'RIGHT')
+        item['login']['uris'].append({"uri": "op://Prod/db"})
+        client = self._client([item])
+
+        self.assertEqual(client.find_item_by_uri_prefix('Prod', 'db')['id'], 'db')
+
+
+class TestOrganizationResolution(unittest.TestCase):
+    """Organization lookups report real errors instead of 'No item found'"""
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_failed_organization_list_is_reported(self, mock_run):
+        mock_run.side_effect = fake_bw({('bw', 'list', 'organizations'): (1, '', 'Vault is locked.')})
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient(no_sync=True)._resolve_organization('MyOrg')
+        self.assertIn('Vault is locked', str(cm.exception))
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_unknown_organization_is_reported(self, mock_run):
+        mock_run.side_effect = fake_bw({('bw', 'list', 'organizations'): '[{"id": "o1", "name": "Other"}]'})
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient(no_sync=True)._resolve_organization('MyOrg')
+        self.assertIn("'MyOrg'", str(cm.exception))
+
+
 class TestEnvironmentProcessor(unittest.TestCase):
     """Test cases for environment variable processing"""
     
