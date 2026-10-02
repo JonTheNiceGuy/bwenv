@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Dict, List, Optional, Set, Tuple
@@ -45,6 +46,33 @@ def debug_print(*args):
 class BWEnvError(Exception):
     """Base exception for bwenv errors."""
     pass
+
+
+IS_WINDOWS = os.name == 'nt'
+DEFAULT_BW_TIMEOUT = 120  # seconds; override with BWENV_TIMEOUT
+
+
+def bw_timeout() -> float:
+    """Seconds to wait for a non-interactive bw command (BWENV_TIMEOUT, default 120)"""
+    value = os.environ.get('BWENV_TIMEOUT', DEFAULT_BW_TIMEOUT)
+    try:
+        timeout = float(value)
+    except ValueError:
+        raise BWEnvError(f"BWENV_TIMEOUT must be a number of seconds, not '{value}'")
+    if timeout <= 0:
+        raise BWEnvError("BWENV_TIMEOUT must be greater than zero")
+    return timeout
+
+
+def resolve_executable(name: str) -> str:
+    """Find a command the way the shell would.
+
+    Windows' CreateProcess only tries '.exe', so an npm-installed bw.cmd is never found without
+    looking it up through PATHEXT first. Elsewhere the OS already searches PATH.
+    """
+    if IS_WINDOWS:
+        return shutil.which(name) or name
+    return name
 
 
 class URIParser:
@@ -111,214 +139,88 @@ class URIParser:
 class BitwardenClient:
     """Client for interacting with Bitwarden CLI"""
     
+    # Commands that need an unlocked vault
+    AUTH_COMMANDS = ('sync', 'list', 'get', 'send')
+    
     def __init__(self, no_sync: bool = False):
         self.sync = not no_sync
+        self._session = os.environ.get('BW_SESSION')
+        self._session_checked = False
         self._items_cache = None
         self._op_items_cache = None
         self._organizations_cache = None
         self._folders_cache = None
         self._collections_cache = None
 
-    def _run_bw_command(self, args: List[str]) -> str:
-        """Run a Bitwarden CLI command and return stdout"""
-        command = ['bw'] + args
-        logging.debug(f"Running Bitwarden CLI command: {' '.join(command)}")
-        logging.debug(f"Command arguments: {args}")
-        logging.debug(f"Full command: {command}")
-        
-        # Check if we need authentication for this command
-        needs_auth = any(cmd in args for cmd in ['sync', 'list', 'get'])
-        logging.debug(f"Command needs authentication: {needs_auth}")
-        
-        bw_session = os.environ.get('BW_SESSION')
-        logging.debug(f"BW_SESSION present: {bool(bw_session)}")
-        if bw_session:
-            logging.debug(f"BW_SESSION length: {len(bw_session)} characters")
-        
-        if needs_auth:
-            # Always check status if we need auth, even if BW_SESSION is set (could be expired)
-            self._validate_session()
-        
-        if needs_auth and not bw_session:
-            logging.debug("No BW_SESSION found, checking if user is logged in...")
-            # First check if user is logged in but not unlocked
-            try:
-                status_result = subprocess.run(
-                    ['bw', 'status'],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                # Handle empty response from mocked tests or real empty responses
-                status_output = status_result.stdout.strip()
-                logging.debug(f"Status command output: {status_output}")
-                if not status_output:
-                    logging.debug("Empty status response, will let command fail naturally if not authenticated")
-                else:
-                    try:
-                        status_data = json.loads(status_output)
-                        logging.debug(f"Parsed status data: {status_data}")
-                        if status_data.get('status') == 'locked':
-                            # Vault is locked, need to unlock interactively
-                            logging.debug("Vault is locked, prompting for unlock")
-                            print("Bitwarden vault is locked. Please enter your master password to unlock:", file=sys.stderr)
-                            unlock_result = subprocess.run(
-                                ['bw', 'unlock', '--raw'],
-                                stdin=sys.stdin,
-                                stdout=subprocess.PIPE,
-                                stderr=sys.stderr,
-                                text=True,
-                                check=True
-                            )
-                            session_token = unlock_result.stdout.strip()
-                            os.environ['BW_SESSION'] = session_token
-                            logging.debug("Successfully unlocked vault and set BW_SESSION")
-                        elif status_data.get('status') == 'unauthenticated':
-                            logging.debug("User is not authenticated")
-                            raise BWEnvError("You are not logged in")
-                    except (json.JSONDecodeError, TypeError):
-                        logging.debug("Failed to parse JSON status response, will let command fail naturally if not authenticated")
-            except subprocess.CalledProcessError as e:
-                stderr = e.stderr or ""
-                if "not logged in" in stderr or "You are not logged in" in stderr:
-                    raise BWEnvError("You are not logged in")
-                logging.debug(f"Status check failed, will let command fail naturally: {stderr.strip()}")
-            except FileNotFoundError:
-                logging.debug("Bitwarden CLI 'bw' command not found during status check")
-                raise BWEnvError("Bitwarden CLI 'bw' not found. Please install it from bitwarden.com")
-        
+    def _bw_env(self) -> Dict[str, str]:
+        """Environment for bw: ours, plus the session this client unlocked (os.environ is never changed)"""
+        env = os.environ.copy()
+        if self._session:
+            env['BW_SESSION'] = self._session
+        return env
+
+    def _exec_bw(self, args: List[str], input_text: Optional[str] = None,
+                 interactive: bool = False) -> subprocess.CompletedProcess:
+        """Run bw and return the completed process. Only the subcommand is logged, never the arguments."""
+        command = [resolve_executable('bw')] + args
+        logging.debug(f"Running Bitwarden CLI command: bw {' '.join(args[:2])}")
         try:
-            logging.debug(f"Executing subprocess: {command}")
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            logging.debug(f"Command completed successfully")
-            logging.debug(f"Return code: {result.returncode}")
-            logging.debug(f"Stdout length: {len(result.stdout)} chars")
-            stderr_len = len(result.stderr) if hasattr(result.stderr, '__len__') else 'unknown'
-            logging.debug(f"Stderr length: {stderr_len} chars")
-            if result.stderr:
-                logging.debug(f"Stderr content: {result.stderr}")
-            return result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr or ""
-            logging.debug(f"Command failed with return code: {e.returncode}")
-            logging.debug(f"Command failed with error: {stderr.strip()}")
-            logging.debug(f"Failed command: {' '.join(command)}")
-            # Check if this is an authentication error that we can handle
-            if needs_auth and not os.environ.get('BW_SESSION') and ("not logged in" in stderr.lower() or "master password" in stderr.lower()):
-                print("Bitwarden authentication required. Please enter your master password:", file=sys.stderr)
-                try:
-                    # Try to unlock the vault
-                    unlock_result = subprocess.run(
-                        ['bw', 'unlock', '--raw'],
-                        stdin=sys.stdin,
-                        stdout=subprocess.PIPE,
-                        stderr=sys.stderr,
-                        text=True,
-                        check=True
-                    )
-                    session_token = unlock_result.stdout.strip()
-                    os.environ['BW_SESSION'] = session_token
-                    logging.debug("Successfully unlocked vault and set BW_SESSION, retrying command")
-                    # Retry the original command
-                    result = subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    logging.debug(f"Retry completed successfully, output length: {len(result.stdout)} chars")
-                    return result.stdout.strip()
-                except subprocess.CalledProcessError as unlock_error:
-                    unlock_stderr = unlock_error.stderr or ""
-                    logging.debug(f"Unlock failed: {unlock_stderr.strip()}")
-                    raise BWEnvError(f"Authentication failed: {unlock_stderr.strip()}")
-            raise BWEnvError(f"Bitwarden CLI error: {stderr.strip()}")
+            if interactive:
+                # The master password prompt needs the terminal: inherit stdin and stderr, capture the token.
+                return subprocess.run(command, stdout=subprocess.PIPE, encoding='utf-8', env=self._bw_env())
+            timeout = bw_timeout()
+            return subprocess.run(command, input=input_text, capture_output=True, encoding='utf-8',
+                                  env=self._bw_env(), timeout=timeout)
         except FileNotFoundError:
-            logging.debug("Bitwarden CLI 'bw' command not found")
             raise BWEnvError("Bitwarden CLI 'bw' not found. Please install it from bitwarden.com")
-    
-    def _validate_session(self):
-        """Validate the current BW_SESSION if it exists"""
-        bw_session = os.environ.get('BW_SESSION')
+        except subprocess.TimeoutExpired:
+            raise BWEnvError(f"'bw {args[0]}' did not finish within {bw_timeout():g} seconds. Is the Bitwarden "
+                             f"server reachable? Set BWENV_TIMEOUT to allow longer.")
+
+    def _run_bw_command(self, args: List[str], input_text: Optional[str] = None) -> str:
+        """Run a Bitwarden CLI command and return stdout"""
+        if args and args[0] in self.AUTH_COMMANDS:
+            self._ensure_unlocked()
         
-        if not bw_session:
-            logging.debug("No BW_SESSION to validate")
+        result = self._exec_bw(args, input_text)
+        logging.debug(f"bw {args[0]} exited {result.returncode}, stdout {len(result.stdout or '')} chars")
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if isinstance(result.stderr, str) else ''
+            raise BWEnvError(f"Bitwarden CLI error running 'bw {args[0]}': {stderr or f'exit code {result.returncode}'}")
+        return result.stdout.strip()
+    
+    def _ensure_unlocked(self):
+        """Check the vault state once per client, unlocking it if it is locked"""
+        if self._session_checked:
             return
         
-        logging.debug("Validating BW_SESSION...")
+        result = self._exec_bw(['status'])
         try:
-            status_result = subprocess.run(
-                ['bw', 'status'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            status_output = status_result.stdout.strip()
-            logging.debug(f"Session validation - status output: {status_output}")
-            
-            if not status_output:
-                logging.debug("Empty status response during session validation")
-                return
-            
-            try:
-                status_data = json.loads(status_output)
-                # Handle case where status might return a list or other structure
-                if isinstance(status_data, dict):
-                    status = status_data.get('status')
-                    logging.debug(f"Session validation - parsed status: {status}")
-                else:
-                    logging.debug(f"Session validation - unexpected status format: {type(status_data)}")
-                    return
-                
-                if status == 'locked':
-                    logging.debug("Session exists but vault is locked - requesting unlock")
-                    # Session is valid but vault is locked, unlock it now
-                    try:
-                        print("Bitwarden vault is locked. Please enter your master password to unlock:", file=sys.stderr)
-                        unlock_result = subprocess.run(
-                            ['bw', 'unlock', '--raw'],
-                            stdin=sys.stdin,
-                            stdout=subprocess.PIPE,
-                            stderr=sys.stderr,
-                            text=True,
-                            check=True
-                        )
-                        session_token = unlock_result.stdout.strip()
-                        os.environ['BW_SESSION'] = session_token
-                        logging.debug("Successfully unlocked vault and updated BW_SESSION during validation")
-                    except subprocess.CalledProcessError as unlock_error:
-                        unlock_stderr = unlock_error.stderr or ""
-                        logging.debug(f"Unlock failed during session validation: {unlock_stderr.strip()}")
-                        # Clear the session since unlock failed
-                        if 'BW_SESSION' in os.environ:
-                            del os.environ['BW_SESSION']
-                        raise BWEnvError(f"Failed to unlock vault: {unlock_stderr.strip()}")
-                elif status == 'unauthenticated':
-                    logging.debug("BW_SESSION is invalid/expired, clearing it")
-                    # Session is invalid, remove it so auth flow can handle login
-                    del os.environ['BW_SESSION']
-                elif status == 'unlocked':
-                    logging.debug("BW_SESSION is valid and vault is unlocked")
-                else:
-                    logging.debug(f"Unknown status during session validation: {status}")
-                    
-            except (json.JSONDecodeError, TypeError) as e:
-                logging.debug(f"Failed to parse status JSON during session validation: {e}")
-                
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr or ""
-            logging.debug(f"Session validation failed: {stderr.strip()}")
-            if "not logged in" in stderr.lower() or "unauthenticated" in stderr.lower():
-                logging.debug("Session validation indicates unauthenticated, clearing BW_SESSION")
-                if 'BW_SESSION' in os.environ:
-                    del os.environ['BW_SESSION']
-        except FileNotFoundError:
-            logging.debug("Bitwarden CLI 'bw' command not found during session validation")
+            status = json.loads(result.stdout).get('status')
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            status = None
+        logging.debug(f"Vault status: {status}")
+        
+        if status == 'unauthenticated':
+            raise BWEnvError("You are not logged in to Bitwarden. Run `bw login` first.")
+        if status == 'locked':
+            self._unlock()
+        # 'unlocked', or a status we cannot read: let the command itself report any problem
+        self._session_checked = True
+    
+    def _unlock(self):
+        """Ask for the master password on the terminal and keep the session for this client"""
+        if not sys.stdin.isatty():
+            raise BWEnvError("The Bitwarden vault is locked and there is no terminal to ask for the master "
+                             "password. Unlock it first, e.g. export BW_SESSION=\"$(bw unlock --raw)\"")
+        
+        print("Bitwarden vault is locked. Please enter your master password to unlock:", file=sys.stderr)
+        result = self._exec_bw(['unlock', '--raw'], interactive=True)
+        session = (result.stdout or '').strip()
+        if result.returncode != 0 or not session:
+            raise BWEnvError(f"Failed to unlock the Bitwarden vault (bw unlock exited {result.returncode})")
+        self._session = session
+        logging.debug("Vault unlocked")
     
     def sync_vault(self):
         """Sync the Bitwarden vault"""

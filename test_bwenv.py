@@ -18,6 +18,21 @@ sys.path.insert(0, script_dir)
 import bwenv
 
 
+def fake_bw(responses):
+    """A subprocess.run side effect that behaves like the bw CLI.
+
+    responses maps an argv tuple to stdout, or to (returncode, stdout, stderr). `bw status` defaults
+    to unlocked; anything else unlisted succeeds with empty-list JSON.
+    """
+    def run(command, **kwargs):
+        response = responses.get(tuple(command))
+        if response is None:
+            response = '{"status":"unlocked"}' if list(command) == ['bw', 'status'] else '[]'
+        returncode, stdout, stderr = response if isinstance(response, tuple) else (0, response, '')
+        return Mock(stdout=stdout, stderr=stderr, returncode=returncode)
+    return run
+
+
 class TestURIParser(unittest.TestCase):
     """Test cases for URI parsing functionality"""
     
@@ -198,103 +213,167 @@ class TestBitwardenClient(unittest.TestCase):
             }
         ]
     
+    def _commands(self, mock_run):
+        return [c.args[0] for c in mock_run.call_args_list]
+
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_run_bw_command_success(self, mock_run):
-        """Test successful Bitwarden CLI command execution"""
-        # Mock both status call and actual command
-        mock_run.side_effect = [
-            Mock(stdout='{"status":"unlocked"}', returncode=0),  # bw status call
-            Mock(stdout="test output", returncode=0)  # actual command
-        ]
-        
+        """A command runs after one status check, with the session, a timeout and UTF-8 decoding"""
+        mock_run.side_effect = fake_bw({('bw', 'list', 'items'): 'test output'})
+
         client = bwenv.BitwardenClient()
         result = client._run_bw_command(['list', 'items'])
-        
+
         self.assertEqual(result, "test output")
-        # Should now make two calls: status validation + actual command
-        self.assertEqual(mock_run.call_count, 2)
-        mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
-        mock_run.assert_any_call(['bw', 'list', 'items'], capture_output=True, text=True, check=True)
-    
+        self.assertEqual(self._commands(mock_run), [['bw', 'status'], ['bw', 'list', 'items']])
+        for call in mock_run.call_args_list:
+            self.assertEqual(call.kwargs['env']['BW_SESSION'], 'test_session_token')
+            self.assertEqual(call.kwargs['encoding'], 'utf-8')
+            self.assertGreater(call.kwargs['timeout'], 0)
+
     @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_run_bw_command_failure(self, mock_run):
-        """Test Bitwarden CLI command failure"""
-        mock_run.side_effect = subprocess.CalledProcessError(
-            1, ['bw', 'list', 'items'], stderr="Authentication required"
-        )
-        
+        """A failing bw command raises BWEnvError carrying bw's stderr"""
+        mock_run.side_effect = fake_bw({('bw', 'list', 'items'): (1, '', 'Authentication required')})
+
         client = bwenv.BitwardenClient()
-        
         with self.assertRaises(bwenv.BWEnvError) as cm:
             client._run_bw_command(['list', 'items'])
-        
+
         self.assertIn("Authentication required", str(cm.exception))
-    
+
     @patch('subprocess.run')
     def test_run_bw_command_not_found(self, mock_run):
         """Test Bitwarden CLI not found"""
         mock_run.side_effect = FileNotFoundError()
-        
+
         client = bwenv.BitwardenClient()
-        
         with self.assertRaises(bwenv.BWEnvError) as cm:
             client._run_bw_command(['list', 'items'])
-        
+
         self.assertIn("not found", str(cm.exception))
-    
-    @patch('subprocess.run')  
-    @patch.dict(os.environ, {'BW_SESSION': 'expired_session_token'})
-    def test_session_validation_clears_expired_session(self, mock_run):
-        """Test that session validation clears expired BW_SESSION"""
-        # Mock status call indicating unauthenticated (expired session)
-        mock_run.return_value = Mock(stdout='{"status":"unauthenticated"}', returncode=0)
-        
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_hung_bw_times_out(self, mock_run):
+        """A bw call that hangs (e.g. the server is unreachable) becomes a BWEnvError, not a hang"""
+        mock_run.side_effect = subprocess.TimeoutExpired(['bw', 'status'], 120)
+
         client = bwenv.BitwardenClient()
-        
-        # Just test the validation method directly
-        client._validate_session()
-        
-        # Verify that BW_SESSION was cleared during validation
-        self.assertNotIn('BW_SESSION', os.environ)
-    
-    @patch('subprocess.run')  
-    @patch.dict(os.environ, {'BW_SESSION': 'locked_session_token'})
-    def test_session_validation_unlocks_locked_vault(self, mock_run):
-        """Test that session validation unlocks a locked vault"""
-        # Mock status call indicating locked, then successful unlock
-        mock_run.side_effect = [
-            Mock(stdout='{"status":"locked"}', returncode=0),  # bw status call
-            Mock(stdout='new_session_token_123', returncode=0)  # bw unlock --raw call
-        ]
-        
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            client._run_bw_command(['list', 'items'])
+
+        self.assertIn("BWENV_TIMEOUT", str(cm.exception))
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token', 'BWENV_TIMEOUT': '5'})
+    def test_timeout_is_configurable(self, mock_run):
+        """BWENV_TIMEOUT sets the timeout passed to bw"""
+        mock_run.side_effect = fake_bw({})
+
+        bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
+
+        self.assertEqual({c.kwargs['timeout'] for c in mock_run.call_args_list}, {5.0})
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_status_checked_once_per_client(self, mock_run):
+        """bw status runs once per client, not before every command"""
+        mock_run.side_effect = fake_bw({})
+
         client = bwenv.BitwardenClient()
-        
-        # Mock stdin to avoid interactive prompt in test
-        with patch('sys.stdin'):
-            client._validate_session()
-        
-        # Verify that BW_SESSION was updated with new token
-        self.assertEqual(os.environ.get('BW_SESSION'), 'new_session_token_123')
-    
+        client._run_bw_command(['sync'])
+        client._run_bw_command(['list', 'items'])
+        client._run_bw_command(['list', 'folders'])
+
+        self.assertEqual(self._commands(mock_run).count(['bw', 'status']), 1)
+
+    @patch('subprocess.run')
+    def test_unauthenticated_is_an_error(self, mock_run):
+        """Not being logged in gives a clear error and runs nothing else"""
+        mock_run.side_effect = fake_bw({('bw', 'status'): '{"status":"unauthenticated"}'})
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
+
+        self.assertIn("not logged in", str(cm.exception))
+        self.assertEqual(self._commands(mock_run), [['bw', 'status']])
+
+    @patch('sys.stdin')
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'stale_session_token'})
+    def test_locked_vault_unlocks_once_on_a_terminal(self, mock_run, mock_stdin):
+        """A locked vault is unlocked once; the new session is used without touching os.environ"""
+        mock_stdin.isatty.return_value = True
+        mock_run.side_effect = fake_bw({
+            ('bw', 'status'): '{"status":"locked"}',
+            ('bw', 'unlock', '--raw'): 'new_session_token_123',
+        })
+
+        client = bwenv.BitwardenClient()
+        client._run_bw_command(['list', 'items'])
+        client._run_bw_command(['list', 'folders'])
+
+        self.assertEqual(self._commands(mock_run).count(['bw', 'unlock', '--raw']), 1)
+        list_calls = [c for c in mock_run.call_args_list if c.args[0][:2] == ['bw', 'list']]
+        self.assertTrue(all(c.kwargs['env']['BW_SESSION'] == 'new_session_token_123' for c in list_calls))
+        self.assertEqual(os.environ['BW_SESSION'], 'stale_session_token')
+
+    @patch('sys.stdin')
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {}, clear=False)
+    def test_locked_vault_without_terminal_does_not_prompt(self, mock_run, mock_stdin):
+        """With no terminal (piped stdin, CI), bwenv never runs bw unlock - piped data is not a password"""
+        os.environ.pop('BW_SESSION', None)
+        mock_stdin.isatty.return_value = False
+        mock_run.side_effect = fake_bw({('bw', 'status'): '{"status":"locked"}'})
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
+
+        self.assertIn("BW_SESSION", str(cm.exception))
+        self.assertNotIn(['bw', 'unlock', '--raw'], self._commands(mock_run))
+
+    @patch('sys.stdin')
+    @patch('subprocess.run')
+    def test_failed_unlock_prompts_once_with_a_reason(self, mock_run, mock_stdin):
+        """A wrong master password gives one prompt and a non-empty error"""
+        mock_stdin.isatty.return_value = True
+        mock_run.side_effect = fake_bw({
+            ('bw', 'status'): '{"status":"locked"}',
+            ('bw', 'unlock', '--raw'): (1, '', ''),
+        })
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
+
+        self.assertIn("unlock", str(cm.exception))
+        self.assertEqual(self._commands(mock_run).count(['bw', 'unlock', '--raw']), 1)
+        self.assertNotIn(['bw', 'list', 'items'], self._commands(mock_run))
+
+    @patch('shutil.which', return_value='C:\\npm\\bw.cmd')
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_windows_finds_npm_installed_bw(self, mock_run, mock_which):
+        """On Windows, bw is resolved through PATHEXT (bw.cmd), which CreateProcess does not do itself"""
+        mock_run.side_effect = fake_bw({})
+        with patch.object(bwenv, 'IS_WINDOWS', True):
+            bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
+
+        self.assertTrue(all(c.args[0][0] == 'C:\\npm\\bw.cmd' for c in mock_run.call_args_list))
+
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_sync_vault(self, mock_run):
         """Test vault synchronization"""
-        # Mock both status call and sync command
-        mock_run.side_effect = [
-            Mock(stdout='{"status":"unlocked"}', returncode=0),  # bw status call
-            Mock(stdout="Syncing complete.", returncode=0)  # bw sync call
-        ]
-        
-        client = bwenv.BitwardenClient()
-        client.sync_vault()
-        
-        # Should now make two calls: status validation + sync
-        self.assertEqual(mock_run.call_count, 2)
-        mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
-        mock_run.assert_any_call(['bw', 'sync'], capture_output=True, text=True, check=True)
-    
+        mock_run.side_effect = fake_bw({})
+
+        bwenv.BitwardenClient().sync_vault()
+
+        self.assertEqual(self._commands(mock_run), [['bw', 'status'], ['bw', 'sync']])
+
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
     def test_get_items_with_op_uris(self, mock_run):
@@ -341,9 +420,8 @@ class TestBitwardenClient(unittest.TestCase):
         items = client.get_items_with_op_uris()
         
         # Should call status validation, sync, then list items
-        mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
-        mock_run.assert_any_call(['bw', 'sync'], capture_output=True, text=True, check=True)
-        mock_run.assert_any_call(['bw', 'list', 'items'], capture_output=True, text=True, check=True)
+        self.assertEqual([c.args[0] for c in mock_run.call_args_list],
+                         [['bw', 'status'], ['bw', 'sync'], ['bw', 'list', 'items']])
     
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
@@ -725,9 +803,7 @@ class TestIntegration(unittest.TestCase):
     @patch('subprocess.run')
     def test_bw_cli_authentication_error(self, mock_run):
         """Test behavior when Bitwarden CLI authentication fails"""
-        mock_run.side_effect = subprocess.CalledProcessError(
-            1, ['bw', 'list', 'items'], stderr="You are not logged in"
-        )
+        mock_run.return_value = Mock(stdout='', stderr="You are not logged in", returncode=1)
         
         client = bwenv.BitwardenClient()
         
