@@ -10,11 +10,12 @@ A cross-platform command-line tool that replaces environment variables containin
 - **URI-Based**: Simple URI style syntax for referencing secrets (see below for details)
 - **Interactive Authentication**: Automatically prompts for master password when needed
 - **Flexible Flag Positions**: Global flags like `--debug` and `--no-sync` can be placed before or after subcommands
-- **Debug Support**: Built-in debug mode for troubleshooting
+- **Debug Support**: Built-in debug mode for troubleshooting that never prints secret values
+- **Secret Sharing**: `bwenv send` turns a reference into a single-use Bitwarden Send link
 
 ## Prerequisites
 
-- Python 3.6 or higher
+- Python 3.7 or higher (tested on 3.7 and the latest release, on Linux, macOS and Windows)
 - [Bitwarden CLI](https://bitwarden.com/help/cli/) installed and accessible in PATH
 - Bitwarden account with vault access
 
@@ -43,7 +44,14 @@ bwenv run [--no-sync] [--debug] -- <command> [args...]
 bwenv [--no-sync] [--debug] read <uri>
 bwenv [--no-sync] read [--debug] <uri>
 bwenv read [--no-sync] [--debug] <uri>
+
+# Send command
+bwenv [--no-sync] [--debug] send [--name <title>] [--max-access N] [--expire-hours H] <uri> [<uri>...]
 ```
+
+For `run`, bwenv's flags are recognised only up to the start of your command (or the first `--`).
+Everything after that belongs to your command, unchanged: `bwenv run grep --debug f` passes `--debug`
+to `grep`, and `bwenv run -- npm run build` runs `npm run build`.
 
 ### URI Formats
 
@@ -55,6 +63,10 @@ Reference secrets using one of these supported formats:
 - `vault_name`: Name of your Bitwarden vault or organization
 - `item_name`: Name of the item containing the secret
 - `field_name`: Field name within the item (supports custom fields, `username`, `password`)
+
+bwenv finds the item whose website URI is exactly `op://vault_name/item_name` (`op://Prod/db` does not
+match an item with `op://Prod/db-prod`). If two items carry the same reference, bwenv stops with an error
+rather than picking one.
 
 #### Bitwarden Native Format
 `bw://vault_or_org/folder_or_collection/item_name/field_name`
@@ -90,6 +102,23 @@ bwenv run python app.py
 bwenv read op://Production/api-keys/stripe_secret
 bwenv read "bw://example.org/collection1/service/username"
 ```
+
+#### Share a secret as a Bitwarden Send:
+```bash
+# One field, as text
+bwenv send op://Production/api-keys/stripe_secret
+
+# A whole item (username, password and custom fields) as JSON
+bwenv send "bw://myvault/Demo/Data/DEMO_DATA"
+
+# Loosen the defaults: three views, valid for two hours, with a title
+bwenv send --max-access 3 --expire-hours 2 --name "For the on-call engineer" op://Production/database/password
+```
+
+By default a Send can be opened **once**, is deleted after **24 hours**, hides its text until the
+recipient reveals it, hides your email address, and is named "Shared secret" so the link does not reveal
+the reference. `--max-access 0` allows unlimited views. With several URIs, each Send is named
+"<name> (n of m)".
 
 #### Use debug mode:
 ```bash
@@ -137,9 +166,10 @@ bwenv --debug run -- docker-compose up --build
 The tool handles Bitwarden authentication automatically:
 
 1. **First run**: You'll need to log in with `bw login`
-2. **Locked vault**: The tool will prompt for your master password
-3. **Session management**: Session tokens are automatically managed
-4. **No interaction needed**: Once authenticated, subsequent runs work seamlessly
+2. **Locked vault**: The tool will prompt for your master password, once per run
+3. **No terminal** (CI, an IDE, piped input): bwenv cannot prompt, so unlock first with
+   `export BW_SESSION="$(bw unlock --raw)"`
+4. **No interaction needed**: Once `BW_SESSION` is set, subsequent runs work seamlessly
 
 ## Field Types
 
@@ -156,22 +186,30 @@ The tool supports various field types:
 - `--help`: Show help information
 - `--`: Command separator to isolate bwenv flags from command flags
 
-Flags can be placed either before or after the subcommand for flexibility. Use `--` after the `run` command to ensure that any flags following it are passed to your command rather than interpreted by bwenv.
+Flags can be placed either before or after the subcommand for flexibility. For `run`, they are only read up to the start of your command; use `--` after `run` to make the boundary explicit.
+
+Environment variables:
+
+- `BWENV_TIMEOUT`: Seconds to wait for each Bitwarden CLI call before giving up (default `120`). Without it, an unreachable server (e.g. a dropped VPN) would hang bwenv indefinitely.
 
 ## Testing
 
 Run the included unit tests:
 
 ```bash
-python -m unittest test_bwenv.py -v
+python -m unittest test_bwenv -v
 ```
+
+The tests mock the Bitwarden CLI, so they need neither `bw` nor a vault.
 
 ## Security Considerations
 
-- Secrets are only held in memory temporarily during command execution
-- No secrets are logged or written to disk
+- No secret values are logged (not even with `--debug`) or written to disk
+- `run` hands the resolved secrets to your command and nothing else: `BW_SESSION`, `BW_PASSWORD`,
+  `BW_CLIENTID` and `BW_CLIENTSECRET` are removed from its environment, so it cannot read the rest of your vault
+- On Linux and macOS, `run` replaces itself with your command, so no bwenv process stays behind holding secrets
+- `send` passes the Send to the Bitwarden CLI on stdin, never on the command line where other users could see it
 - Uses official Bitwarden CLI for all vault operations
-- Session tokens are managed securely
 
 ## Troubleshooting
 
@@ -182,6 +220,8 @@ python -m unittest test_bwenv.py -v
 3. **"Master password required"**: The tool will prompt automatically
 4. **"No item found"**: Check your vault name, item name, and field name
 5. **"Field not found"**: Verify the field exists in the specified item
+6. **"did not finish within 120 seconds"**: The Bitwarden server is unreachable (check your network or VPN), or a very large vault needs a longer `BWENV_TIMEOUT`
+7. **"items named ... match" / "items have the URI"**: More than one item fits the reference; add the folder or collection (`bw://`), or keep the `op://` URI on only one item
 
 ### Debug Mode
 
@@ -195,20 +235,20 @@ Debug output includes:
 - **Command parsing**: Arguments, Python version, working directory
 - **Environment scanning**: Discovery of op:// URIs in environment variables
 - **Bitwarden CLI operations**: Command execution with timing and response details
-- **Authentication status**: BW_SESSION presence and authentication flow
+- **Authentication status**: Vault status and unlock flow
 - **Item resolution**: Vault searches, item matching, and field lookups
 - **Performance metrics**: Sync timing and operation durations
-- **Value handling**: Safe previews of resolved secrets (truncated for security)
+- **Value handling**: The length of each resolved secret only, never its value
 
 Example debug output:
 ```
 [DEBUG 15:55:14] Debug mode enabled
 [DEBUG 15:55:14] Command: run
-[DEBUG 15:55:14] BW_SESSION present: True
-[DEBUG 15:55:14] Found 2 environment variables with op:// URIs
+[DEBUG 15:55:14] Vault status: unlocked
+[DEBUG 15:55:14] Found 2 environment variables with supported URIs
 [DEBUG 15:55:15] Vault sync completed in 1.70 seconds
 [DEBUG 15:55:19] Found matching item: DEMO_DATA (ID: aaaaaaaa-1111-bbbb-2222-cccccccccccc)
-[DEBUG 15:55:19] Successfully resolved URI to value (length: 22 chars)
+[DEBUG 15:55:19] Successfully resolved op:// URI op://Personal/demo/prod/plaintext to value (length: 22 chars)
 ```
 
 ## License
@@ -256,4 +296,4 @@ This is a community project. For support:
 - **v1.7**: Fixed argument parsing to ensure consistent behavior regardless of flag positions. All flag combinations (`--debug run`, `run --debug`, etc.) now work identically while properly respecting the `--` separator boundary.
 - **v1.8**: Added support for Bitwarden native URI format (`bw://`) alongside existing 1Password-compatible format (`op://`). The new format supports organization/collection paths, personal vault items, and UUID-based targeting for precise item resolution.
 - **v1.9**: Implemented the `send` subcommand to create Bitwarden Sends directly from a URI. It can send a single secret value for field-specific URIs or a JSON object of the entire item for item-only URIs, with an optional `--name flag` for custom titles.
-- **v1.10**: Fixed `bw://` URIs ignoring the folder or collection: the path now selects the item, an unknown folder or collection is an error, and an item name shared by several items is an error unless the path chooses one. Fixed `op://` URIs finding no items with current Bitwarden CLIs, whose `--search` no longer matches website URIs; items are now filtered locally. Cached the item, organization, folder and collection lists so each runs once per invocation, including a single `bw sync` (thanks to @lewis-lees for the item cache).
+- **v1.10**: Security and correctness release. Secrets no longer leak: `--debug` logs value lengths, never values; `send` no longer logs its payload and passes it to `bw` on stdin instead of the command line; `run` strips `BW_SESSION` and other Bitwarden credentials from the command's environment. Sends now default to one view, hidden text, hidden email and a generic name, with new `--max-access` and `--expire-hours` options, and `op://vault/item` whole-item sends work. Lookups no longer return the wrong secret: `bw://` URIs honour the folder or collection (an unknown one is an error), `op://` matches the exact item rather than any item whose name starts the same, and a reference matching several items is an error. Fixed `op://` finding nothing with current Bitwarden CLIs, whose `--search` no longer matches website URIs. `run -- npm run build` (and `docker`/`cargo`/`kubectl run`) works, and flags after your command are left for it. `run` execs the command on Linux and macOS, so it gets Ctrl-C and SIGTERM and its exit status is bwenv's. Every `bw` call has a timeout (`BWENV_TIMEOUT`), the vault is unlocked at most once and never from piped input, output is decoded as UTF-8, and an npm-installed `bw.cmd` is found on Windows. Item, organization, folder and collection lists are fetched once per run (thanks to @lewis-lees for the item cache). Requires Python 3.7+; tests run on Linux, macOS and Windows.

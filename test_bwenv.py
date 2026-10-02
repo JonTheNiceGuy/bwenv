@@ -118,11 +118,9 @@ class TestURIParser(unittest.TestCase):
         result = bwenv.URIParser.parse_bw_uri(uri)
         self.assertEqual(result, uri)  # Should return the URI itself if valid
     
-    @unittest.skipUnless(os.environ.get('TEST_ORG_NAME'), "TEST_ORG_NAME environment variable not set")
     def test_parse_bw_uri_with_org_name(self):
-        """Test parsing bw:// URIs with real org name from environment"""
-        org_name = os.environ.get('TEST_ORG_NAME')
-        uri = f"bw://{org_name}/Demo/Data/DEMO_DATA/password"
+        """Test parsing bw:// URIs with an organization name (spaces and dots included)"""
+        uri = "bw://Example Org.fm/Demo/Data/DEMO_DATA/password"
         result = bwenv.URIParser.parse_bw_uri(uri)
         self.assertEqual(result, uri)  # Should return the URI itself if valid
     
@@ -219,7 +217,7 @@ class TestBitwardenClient(unittest.TestCase):
         ]
     
     def _commands(self, mock_run):
-        return [c.args[0] for c in mock_run.call_args_list]
+        return [c[0][0] for c in mock_run.call_args_list]
 
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
@@ -233,9 +231,9 @@ class TestBitwardenClient(unittest.TestCase):
         self.assertEqual(result, "test output")
         self.assertEqual(self._commands(mock_run), [['bw', 'status'], ['bw', 'list', 'items']])
         for call in mock_run.call_args_list:
-            self.assertEqual(call.kwargs['env']['BW_SESSION'], 'test_session_token')
-            self.assertEqual(call.kwargs['encoding'], 'utf-8')
-            self.assertGreater(call.kwargs['timeout'], 0)
+            self.assertEqual(call[1]['env']['BW_SESSION'], 'test_session_token')
+            self.assertEqual(call[1]['encoding'], 'utf-8')
+            self.assertGreater(call[1]['timeout'], 0)
 
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
@@ -280,7 +278,7 @@ class TestBitwardenClient(unittest.TestCase):
 
         bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
 
-        self.assertEqual({c.kwargs['timeout'] for c in mock_run.call_args_list}, {5.0})
+        self.assertEqual({c[1]['timeout'] for c in mock_run.call_args_list}, {5.0})
 
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
@@ -322,8 +320,8 @@ class TestBitwardenClient(unittest.TestCase):
         client._run_bw_command(['list', 'folders'])
 
         self.assertEqual(self._commands(mock_run).count(['bw', 'unlock', '--raw']), 1)
-        list_calls = [c for c in mock_run.call_args_list if c.args[0][:2] == ['bw', 'list']]
-        self.assertTrue(all(c.kwargs['env']['BW_SESSION'] == 'new_session_token_123' for c in list_calls))
+        list_calls = [c for c in mock_run.call_args_list if c[0][0][:2] == ['bw', 'list']]
+        self.assertTrue(all(c[1]['env']['BW_SESSION'] == 'new_session_token_123' for c in list_calls))
         self.assertEqual(os.environ['BW_SESSION'], 'stale_session_token')
 
     @patch('sys.stdin')
@@ -367,7 +365,7 @@ class TestBitwardenClient(unittest.TestCase):
         with patch.object(bwenv, 'IS_WINDOWS', True):
             bwenv.BitwardenClient()._run_bw_command(['list', 'items'])
 
-        self.assertTrue(all(c.args[0][0] == 'C:\\npm\\bw.cmd' for c in mock_run.call_args_list))
+        self.assertTrue(all(c[0][0][0] == 'C:\\npm\\bw.cmd' for c in mock_run.call_args_list))
 
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
@@ -425,7 +423,7 @@ class TestBitwardenClient(unittest.TestCase):
         items = client.get_items_with_op_uris()
         
         # Should call status validation, sync, then list items
-        self.assertEqual([c.args[0] for c in mock_run.call_args_list],
+        self.assertEqual([c[0][0] for c in mock_run.call_args_list],
                          [['bw', 'status'], ['bw', 'sync'], ['bw', 'list', 'items']])
     
     @patch('subprocess.run')
@@ -476,7 +474,7 @@ class TestBitwardenClient(unittest.TestCase):
         self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/secret'), 'secret_value')
         self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/username'), 'testuser')
 
-        commands = [c.args[0] for c in mock_run.call_args_list]
+        commands = [c[0][0] for c in mock_run.call_args_list]
         self.assertEqual(commands.count(['bw', 'sync']), 1)
         self.assertEqual(commands.count(['bw', 'list', 'items']), 1)
 
@@ -523,7 +521,7 @@ class TestBitwardenClient(unittest.TestCase):
         self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/secret'), 'secret_value')
         self.assertIsNotNone(client.find_item_by_uri_prefix("Employee", "example"))
 
-        commands = [c.args[0] for c in mock_run.call_args_list]
+        commands = [c[0][0] for c in mock_run.call_args_list]
         self.assertEqual(commands.count(['bw', 'sync']), 1)
         self.assertEqual(commands.count(['bw', 'list', 'items']), 1)
 
@@ -548,7 +546,7 @@ class TestBitwardenClient(unittest.TestCase):
         self.assertEqual(client._resolve_organization('Example Org'), 'org-uuid-1')
         self.assertIsNone(client._resolve_organization('myvault'))
 
-        commands = [c.args[0] for c in mock_run.call_args_list]
+        commands = [c[0][0] for c in mock_run.call_args_list]
         self.assertEqual(commands.count(['bw', 'list', 'organizations']), 1)
 
 
@@ -675,7 +673,7 @@ class TestBwUriPathResolution(unittest.TestCase):
         self.client.resolve_bw_uri_to_value('bw://myvault/Prod/DEMO_DATA/secret')
         self.client.resolve_bw_uri_to_value('bw://Example Org/Demo/Data/DEMO_DATA/secret')
         self.client.resolve_bw_uri_to_value('bw://Example Org/Other/DEMO_DATA/secret')
-        commands = [c.args[0] for c in self.mock_run.call_args_list]
+        commands = [c[0][0] for c in self.mock_run.call_args_list]
         self.assertEqual(commands.count(['bw', 'list', 'folders']), 1)
         self.assertEqual(commands.count(['bw', 'list', 'collections']), 1)
 
@@ -1041,7 +1039,7 @@ class TestRunCommand(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 bwenv.run_command(self._args('npm', 'start'))
 
-        command, argv, env = mock_exec.call_args.args
+        command, argv, env = mock_exec.call_args[0]
         self.assertEqual((command, argv), ('npm', ['npm', 'start']))
         self.assertEqual(env, {'PLAIN': 'value'})
 
@@ -1067,7 +1065,7 @@ class TestRunCommand(unittest.TestCase):
             bwenv.run_command(self._args('npm', 'start'))
 
         self.assertEqual(cm.exception.code, 3)
-        self.assertEqual(mock_popen.call_args.args[0], ['C:\\nodejs\\npm.cmd', 'start'])
+        self.assertEqual(mock_popen.call_args[0][0], ['C:\\nodejs\\npm.cmd', 'start'])
         self.assertEqual(process.wait.call_count, 2)
 
     @patch('subprocess.run')
@@ -1088,74 +1086,88 @@ class TestRunCommand(unittest.TestCase):
 
 
 class TestFunctional(unittest.TestCase):
-    """Functional tests for the complete bwenv workflow"""
-    
+    """Functional tests: run bwenv.py as a real process, on any OS"""
+
     def setUp(self):
         """Set up test fixtures"""
-        self.test_script = ['python', os.path.join(os.path.dirname(__file__), 'bwenv.py')]
-    
+        self.test_script = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bwenv.py')]
+        # The real environment (Windows needs SYSTEMROOT, everything needs PATH), minus anything bwenv would resolve
+        self.env = {key: value for key, value in os.environ.items()
+                    if not bwenv.URIParser.is_supported_uri(value) and key not in bwenv.BW_CREDENTIAL_VARS}
+        self.env['TEST_VAR'] = 'normal_value'
+
+    def _child(self, code):
+        """A portable child command: the running Python executing `code`"""
+        return [sys.executable, '-c', code]
+
+    def _run(self, *argv):
+        return subprocess.run(self.test_script + list(argv), capture_output=True, text=True, env=self.env)
+
     def test_script_help(self):
         """Test that the script shows help correctly"""
-        result = subprocess.run(self.test_script + ['--help'], capture_output=True, text=True)
+        result = self._run('--help')
         self.assertEqual(result.returncode, 0)
         self.assertIn("Bitwarden Environment Variable Processor", result.stdout)
         self.assertIn("run", result.stdout)
         self.assertIn("read", result.stdout)
-    
+
     def test_script_no_args(self):
         """Test script behavior with no arguments"""
-        result = subprocess.run(self.test_script, capture_output=True, text=True)
+        result = self._run()
         self.assertEqual(result.returncode, 1)
         self.assertIn("usage:", result.stdout)
-    
+
     def test_run_command_no_command(self):
         """Test run subcommand with no command specified"""
-        result = subprocess.run(self.test_script + ['run'], capture_output=True, text=True)
+        result = self._run('run')
         self.assertEqual(result.returncode, 1)
         self.assertIn("No command specified", result.stderr)
-    
-    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
+
     def test_run_command_no_op_vars(self):
-        """Test running command when no op:// variables are present"""
-        # This should work since there are no op:// vars to resolve
-        result = subprocess.run(self.test_script + ['run', 'echo', 'test'], 
-                              capture_output=True, text=True)
-        # The script should succeed because no BW lookup is needed
-        self.assertEqual(result.returncode, 0)
-    
-    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
-    def test_run_command_with_separator_no_op_vars(self):
-        """Test running command with '--' separator when no op:// variables are present"""
-        result = subprocess.run(self.test_script + ['run', '--', 'echo', 'test'], 
-                              capture_output=True, text=True)
-        # The script should succeed because no BW lookup is needed
+        """With no references to resolve, the command runs without touching Bitwarden"""
+        result = self._run('run', *self._child("print('test')"))
         self.assertEqual(result.returncode, 0)
         self.assertIn('test', result.stdout)
-    
-    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
+
+    def test_run_command_with_separator_no_op_vars(self):
+        """Test running command with '--' separator when no op:// variables are present"""
+        result = self._run('run', '--', *self._child("print('test')"))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('test', result.stdout)
+
     def test_separator_flag_isolation(self):
         """Test that flags are properly isolated by '--' separator"""
-        result = subprocess.run(self.test_script + ['--no-sync', 'run', '--', 'echo', '--help'], 
-                              capture_output=True, text=True)
-        # Should succeed and echo '--help' (not show bwenv help)
+        result = self._run('--no-sync', 'run', '--', *self._child("import sys; print(sys.argv[1:])"), '--help')
         self.assertEqual(result.returncode, 0)
         self.assertIn('--help', result.stdout)
         self.assertNotIn('usage:', result.stdout)
-    
-    @patch.dict(os.environ, {'TEST_VAR': 'normal_value'}, clear=True)
+
     def test_backward_compatibility(self):
         """Test that existing usage patterns still work"""
-        # Test original flag usage
-        result = subprocess.run(self.test_script + ['--no-sync', 'run', 'echo', 'backward_compat'], 
-                              capture_output=True, text=True)
+        result = self._run('--no-sync', 'run', *self._child("print('backward_compat')"))
         self.assertEqual(result.returncode, 0)
         self.assertIn('backward_compat', result.stdout)
-        
-        # Test subcommand flags
-        result = subprocess.run(self.test_script + ['run', '--no-sync', 'echo', 'subcommand_flags'], 
-                              capture_output=True, text=True)
+
+        result = self._run('run', '--no-sync', *self._child("print('subcommand_flags')"))
         self.assertEqual(result.returncode, 0)
         self.assertIn('subcommand_flags', result.stdout)
+
+    def test_exit_code_is_the_childs(self):
+        """bwenv run exits with the command's own exit code"""
+        result = self._run('run', '--', *self._child("import sys; sys.exit(3)"))
+        self.assertEqual(result.returncode, 3)
+
+    def test_child_does_not_receive_bw_session(self):
+        """The command bwenv runs does not inherit BW_SESSION"""
+        self.env['BW_SESSION'] = 'not-for-the-child'
+        result = self._run('run', '--', *self._child("import os; print(os.environ.get('BW_SESSION', '<unset>'))"))
+        self.assertEqual(result.stdout.strip(), '<unset>')
+
+    def test_missing_command_exits_127(self):
+        """A command that does not exist exits 127"""
+        result = self._run('run', '--', 'no-such-command-for-bwenv-tests')
+        self.assertEqual(result.returncode, 127)
+        self.assertIn('not found', result.stderr)
 
 
 class TestSendCommand(unittest.TestCase):
@@ -1190,14 +1202,14 @@ class TestSendCommand(unittest.TestCase):
         with patch('builtins.print') as mock_print, self.assertLogs(level='DEBUG') as logs:
             logging.getLogger().debug("send test start")
             bwenv.send_item(args)
-        return [c.args[0] for c in mock_print.call_args_list], '\n'.join(logs.output)
+        return [c[0][0] for c in mock_print.call_args_list], '\n'.join(logs.output)
 
     def _created_sends(self):
         sends = []
         for call in self.mock_run.call_args_list:
-            if call.args[0][1:3] == ['send', 'create']:
-                self.assertEqual(call.args[0], ['bw', 'send', 'create'], "payload must not be on the command line")
-                sends.append(json.loads(base64.b64decode(call.kwargs['input'])))
+            if call[0][0][1:3] == ['send', 'create']:
+                self.assertEqual(call[0][0], ['bw', 'send', 'create'], "payload must not be on the command line")
+                sends.append(json.loads(base64.b64decode(call[1]['input'])))
         return sends
 
     def test_field_send_goes_through_stdin_with_safe_defaults(self):
@@ -1211,7 +1223,7 @@ class TestSendCommand(unittest.TestCase):
         self.assertTrue(send['hideEmail'])
         self.assertEqual(send['maxAccessCount'], 1)
         self.assertEqual(send['name'], 'Shared secret')
-        self.assertNotIn(['bw', 'encode'], [c.args[0] for c in self.mock_run.call_args_list])
+        self.assertNotIn(['bw', 'encode'], [c[0][0] for c in self.mock_run.call_args_list])
         self.assertNotIn(self.SECRET, logs)
         self.assertNotIn(base64.b64encode(self.SECRET.encode()).decode()[:16], logs)
 
@@ -1264,7 +1276,7 @@ class TestSendCommand(unittest.TestCase):
         with patch('sys.stderr') as mock_stderr, self.assertRaises(SystemExit):
             self._send('op://Prod/svc/password')
 
-        written = ''.join(str(c.args[0]) for c in mock_stderr.write.call_args_list)
+        written = ''.join(str(c[0][0]) for c in mock_stderr.write.call_args_list)
         self.assertNotIn(self.SECRET, written)
 
 
@@ -1305,7 +1317,7 @@ class TestSendCommandIntegration(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures"""
-        self.test_script = ['python', os.path.join(os.path.dirname(__file__), 'bwenv.py')]
+        self.test_script = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bwenv.py')]
     
     def test_send_command_help(self):
         """Test send command help"""

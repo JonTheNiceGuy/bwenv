@@ -8,12 +8,17 @@ with actual secret values using the Bitwarden CLI.
 Usage:
     bwenv run [--no-sync] [--debug] <command> [args...]
     bwenv read [--no-sync] [--debug] <uri>
-    bwenv send [--no-sync] [--debug] [--name <title>] <uri>
+    bwenv send [--no-sync] [--debug] [--name <title>] [--max-access N] [--expire-hours H] <uri>...
 
 Examples:
     bwenv run sh
     bwenv read op://Employee/example/secret
     bwenv run --no-sync python app.py
+    bwenv run -- npm run build
+    bwenv send --max-access 3 op://Employee/example/secret
+
+Environment:
+    BWENV_TIMEOUT   seconds to wait for each Bitwarden CLI call (default 120)
 """
 
 import argparse
