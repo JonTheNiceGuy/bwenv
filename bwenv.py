@@ -28,6 +28,9 @@ import subprocess
 import sys
 from typing import Dict, List, Optional, Set, Tuple
 
+if sys.version_info < (3, 7):
+    sys.exit("bwenv needs Python 3.7 or newer")
+
 
 def setup_logging(debug: bool = False):
     """Setup logging configuration"""
@@ -67,6 +70,15 @@ def bw_timeout() -> float:
     if timeout <= 0:
         raise BWEnvError("BWENV_TIMEOUT must be greater than zero")
     return timeout
+
+
+def use_utf8_stdout():
+    """Write stdout as UTF-8, so a secret outside the console code page (e.g. cp1252) still prints"""
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except (ValueError, OSError):
+            pass
 
 
 def resolve_executable(name: str) -> str:
@@ -684,37 +696,42 @@ class EnvironmentProcessor:
 
 
 def run_command(args: argparse.Namespace):
-    """Run a command with resolved environment variables"""
-    logging.debug(f"Running command: {' '.join(args.cmd_args)}")
+    """Run a command with resolved environment variables. Does not return."""
+    logging.debug(f"Running command: {args.cmd_args[0]} (+{len(args.cmd_args) - 1} arguments)")
     logging.debug(f"Sync enabled: {not args.no_sync}")
-    logging.debug(f"Command arguments count: {len(args.cmd_args)}")
     
     bw_client = BitwardenClient(no_sync=args.no_sync)
     processor = EnvironmentProcessor(bw_client)
-    
     resolved_env = processor.create_resolved_environment()
+    exec_command(args.cmd_args, resolved_env)
+
+
+def exec_command(cmd_args: List[str], env: Dict[str, str]):
+    """Hand over to the command, so signals and the exit status are its own. Does not return.
     
+    On POSIX bwenv replaces itself with the command (exec): Ctrl-C and SIGTERM reach it directly,
+    its exit status (including death by signal) is bwenv's, and no bwenv process stays behind
+    holding the secrets. Windows has no real exec, so bwenv waits for the command instead.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
     try:
-        logging.debug(f"Executing command with {len(resolved_env)} environment variables")
-        uri_vars = processor.scan_environment()
-        logging.debug(f"Resolved variables with supported URIs: {[k for k in resolved_env.keys() if k in uri_vars]}")
-        # Execute the command with the resolved environment
-        result = subprocess.run(
-            args.cmd_args,
-            env=resolved_env,
-            stdin=sys.stdin,
-            stdout=sys.stdout,
-            stderr=sys.stderr
-        )
-        logging.debug(f"Command completed with exit code: {result.returncode}")
-        sys.exit(result.returncode)
-    except KeyboardInterrupt:
-        logging.debug("Command interrupted by user")
-        sys.exit(130)
-    except Exception as e:
-        logging.debug(f"Exception during command execution: {e}")
+        if not IS_WINDOWS:
+            os.execvpe(cmd_args[0], cmd_args, env)
+        process = subprocess.Popen([resolve_executable(cmd_args[0])] + cmd_args[1:], env=env)
+    except FileNotFoundError:
+        print(f"Error executing command: '{cmd_args[0]}' not found", file=sys.stderr)
+        sys.exit(127)
+    except OSError as e:
         print(f"Error executing command: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(126)
+    
+    while True:
+        try:
+            sys.exit(process.wait())
+        except KeyboardInterrupt:
+            # The console delivered Ctrl-C to the command too; let it decide when to exit
+            continue
 
 
 def read_secret(args: argparse.Namespace):
@@ -729,6 +746,7 @@ def read_secret(args: argparse.Namespace):
     try:
         value = processor.resolve_uri(args.uri)
         logging.debug(f"Successfully retrieved secret (length: {len(value)} chars)")
+        use_utf8_stdout()
         print(value)
     except BWEnvError as e:
         logging.debug(f"Failed to read secret: {e}")
@@ -742,6 +760,7 @@ def send_item(args: argparse.Namespace):
     
     bw_client = BitwardenClient(no_sync=args.no_sync)
     base_name = args.name or SEND_DEFAULT_NAME
+    use_utf8_stdout()
     total = len(args.uri)
     
     try:

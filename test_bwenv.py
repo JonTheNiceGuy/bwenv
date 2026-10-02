@@ -6,6 +6,7 @@ Unit tests for bwenv script
 import argparse
 import base64
 import datetime
+import io
 import json
 import logging
 import os
@@ -1024,6 +1025,66 @@ class TestArgumentParsing(unittest.TestCase):
         args = self._parse('send', '--no-sync', '--name', 'X', 'op://v/i/f', '--max-access', '3')
         self.assertTrue(args.no_sync)
         self.assertEqual((args.name, args.uri, args.max_access), ('X', ['op://v/i/f'], 3))
+
+
+class TestRunCommand(unittest.TestCase):
+    """`run` hands over to the child so signals and exit codes are the child's own"""
+
+    def _args(self, *cmd):
+        return argparse.Namespace(cmd_args=list(cmd), no_sync=True, debug=False)
+
+    @patch.dict(os.environ, {'BW_SESSION': 'session', 'PLAIN': 'value'}, clear=True)
+    def test_posix_replaces_bwenv_with_the_child(self):
+        """On POSIX, bwenv execs the child: Ctrl-C, SIGTERM and the exit status go straight to it"""
+        with patch.object(bwenv, 'IS_WINDOWS', False), patch('os.execvpe') as mock_exec:
+            mock_exec.side_effect = SystemExit(0)  # exec never returns
+            with self.assertRaises(SystemExit):
+                bwenv.run_command(self._args('npm', 'start'))
+
+        command, argv, env = mock_exec.call_args.args
+        self.assertEqual((command, argv), ('npm', ['npm', 'start']))
+        self.assertEqual(env, {'PLAIN': 'value'})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_missing_command_exits_127(self):
+        """A command that does not exist exits 127, like a shell, without a traceback"""
+        with patch.object(bwenv, 'IS_WINDOWS', False), \
+                patch('os.execvpe', side_effect=FileNotFoundError(2, 'No such file')), \
+                patch('sys.stderr'), self.assertRaises(SystemExit) as cm:
+            bwenv.run_command(self._args('no-such-command'))
+
+        self.assertEqual(cm.exception.code, 127)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_windows_waits_through_ctrl_c_and_passes_exit_code(self):
+        """On Windows (no real exec), Ctrl-C does not kill the child; its exit code is bwenv's"""
+        process = Mock()
+        process.wait.side_effect = [KeyboardInterrupt(), 3]
+        with patch.object(bwenv, 'IS_WINDOWS', True), \
+                patch('shutil.which', return_value='C:\\nodejs\\npm.cmd'), \
+                patch('subprocess.Popen', return_value=process) as mock_popen, \
+                self.assertRaises(SystemExit) as cm:
+            bwenv.run_command(self._args('npm', 'start'))
+
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(mock_popen.call_args.args[0], ['C:\\nodejs\\npm.cmd', 'start'])
+        self.assertEqual(process.wait.call_count, 2)
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_read_prints_utf8_whatever_the_console_encoding(self, mock_run):
+        """A secret outside the console code page (e.g. cp1252 on Windows) still prints, as UTF-8"""
+        items = [{"id": "i1", "name": "svc", "organizationId": None, "fields": [],
+                  "login": {"password": "Ā-π-€", "uris": [{"uri": "op://Prod/svc"}]}}]
+        mock_run.side_effect = fake_bw({('bw', 'list', 'items'): json.dumps(items)})
+        buffer = io.BytesIO()
+        stdout = io.TextIOWrapper(buffer, encoding='cp1252')
+
+        with patch('sys.stdout', stdout):
+            bwenv.read_secret(argparse.Namespace(uri='op://Prod/svc/password', no_sync=True))
+            stdout.flush()
+
+        self.assertEqual(buffer.getvalue().decode('utf-8').strip(), 'Ā-π-€')
 
 
 class TestFunctional(unittest.TestCase):
