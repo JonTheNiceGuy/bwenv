@@ -755,96 +755,27 @@ def send_item(args: argparse.Namespace):
         sys.exit(1)
 
 
-def parse_args_with_separator():
-    """Parse arguments handling the '--' separator for command isolation"""
-    argv = sys.argv[1:]  # Skip script name
-    
-    # Manual parsing to handle --debug and --no-sync flags in any position
-    debug = False
-    no_sync = False
-    command = None
-    uri = None
-    cmd_args = None
-    
-    # Find '--' separator if it exists after 'run' command
-    separator_idx = None
-    run_idx = None
-    
-    # Find the '--' separator first to know where we can extract flags from
-    separator_idx = None
-    run_command_idx = None
-    for i, arg in enumerate(argv):
-        if arg == '--':
-            separator_idx = i
-        elif arg == 'run':
-            run_command_idx = i
-    
-    # Validate that if '--' exists, it should come after 'run'
-    if separator_idx is not None and run_command_idx is not None and separator_idx < run_command_idx:
-        print("Error: '--' separator must come after 'run' command", file=sys.stderr)
-        sys.exit(1)
-    
-    # Only extract flags before the '--' separator (if it exists)
-    flag_extraction_limit = separator_idx if separator_idx is not None else len(argv)
-    
-    # First pass: extract global flags and find command structure
-    filtered_argv = []
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if i < flag_extraction_limit and arg == '--debug':
-            debug = True
-        elif i < flag_extraction_limit and arg == '--no-sync':
-            no_sync = True
-        elif arg in ['run', 'read', 'send']:
-            command = arg
-            if command == 'run':
-                run_idx = len(filtered_argv)  # Position in filtered argv
-            filtered_argv.append(arg)
-        else:
-            filtered_argv.append(arg)
-        i += 1
-    
-    argv = filtered_argv
-    
-    # Update separator_idx in the filtered argv
-    if separator_idx is not None:
-        # Find the new position of '--' in filtered argv
-        separator_idx = None
-        for i, arg in enumerate(argv):
-            if arg == '--':
-                separator_idx = i
-                break
-    
-    if separator_idx is not None:
-        # Split arguments at '--'
-        bwenv_args = argv[:separator_idx]
-        cmd_args = argv[separator_idx + 1:]
-    else:
-        # No '--' found, use original behavior
-        bwenv_args = argv
-        if command == 'run' and len(bwenv_args) > 1:
-            # Everything after 'run' is cmd_args
-            cmd_args = bwenv_args[1:]
-            bwenv_args = bwenv_args[:1]  # Just keep 'run'
-    
-    # Parse remaining arguments with argparse
+BWENV_FLAGS = ('--debug', '--no-sync')
+SUBCOMMANDS = ('run', 'read', 'send')
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The argparse parser for bwenv's subcommands (--debug/--no-sync are extracted beforehand)"""
     parser = argparse.ArgumentParser(
         description="Bitwarden Environment Variable Processor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
+    parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output (never includes secret values)')
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    # Run command
-    run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
+    subparsers.add_parser('run', help='Run a command with resolved environment variables')
     
-    # Read command
     read_parser = subparsers.add_parser('read', help='Read a specific secret value')
     read_parser.add_argument('uri', help='URI to read (e.g., op://Employee/example/secret)')
     
-    # Send command
     send_parser = subparsers.add_parser('send', help='Create a Bitwarden Send from a URI')
     send_parser.add_argument('uri', help='URI(s) to send (e.g., op://Employee/example/secret or bw://MyOrg/Collection/Path/item/custom/field)', nargs="+")
     send_parser.add_argument('--name', help=f'Name for the send (default: "{SEND_DEFAULT_NAME}")')
@@ -852,51 +783,74 @@ def parse_args_with_separator():
                              help='How many times the send can be opened; 0 for unlimited (default: 1)')
     send_parser.add_argument('--expire-hours', type=float, default=24.0,
                              help='Hours until the send is deleted (default: 24)')
+    return parser
+
+
+def parse_args_with_separator(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse bwenv's arguments, keeping the child command of `run` intact.
     
-    args = parser.parse_args(bwenv_args)
+    --debug and --no-sync may appear before or after the subcommand. For `run`, they are only
+    recognised up to the start of the child command or the first `--`; everything from there on is
+    the child's, unchanged - including words such as run/read/send and any further `--`.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    flags = set()
     
-    # Set the manually parsed flags
-    args.debug = debug
-    args.no_sync = no_sync
+    # Before the subcommand: bwenv flags only
+    i = 0
+    while i < len(argv) and argv[i] in BWENV_FLAGS:
+        flags.add(argv[i])
+        i += 1
+    if i < len(argv) and argv[i] == '--':
+        print("Error: '--' separator must come after 'run' command", file=sys.stderr)
+        sys.exit(1)
     
-    # Set cmd_args for run command
+    command = argv[i] if i < len(argv) else None
+    rest = argv[i + 1:]
+    cmd_args = None
+    
+    if command == 'run':
+        j = 0
+        while j < len(rest) and rest[j] in BWENV_FLAGS:
+            flags.add(rest[j])
+            j += 1
+        if j < len(rest) and rest[j] in ('-h', '--help'):
+            bwenv_args = ['run', rest[j]]  # bwenv's own help for run
+        else:
+            if j < len(rest) and rest[j] == '--':
+                j += 1
+            cmd_args = rest[j:]
+            bwenv_args = ['run']
+    else:
+        # read and send run no child command, so bwenv flags may appear anywhere
+        flags.update(arg for arg in rest if arg in BWENV_FLAGS)
+        bwenv_args = argv[i:i + 1] + [arg for arg in rest if arg not in BWENV_FLAGS]
+    
+    args = build_parser().parse_args(bwenv_args)
+    args.debug = '--debug' in flags
+    args.no_sync = '--no-sync' in flags
     if args.command == 'run':
         args.cmd_args = cmd_args or []
-    
     return args
 
 
 def main():
     args = parse_args_with_separator()
     
-    if not args.command:
-        # Show help and exit
-        parser = argparse.ArgumentParser(
-            description="Bitwarden Environment Variable Processor",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=__doc__
-        )
-        parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
-        parser.add_argument('--debug', action='store_true', help='Enable debug output')
-        subparsers = parser.add_subparsers(dest='command', help='Available commands')
-        run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
-        read_parser = subparsers.add_parser('read', help='Read a specific secret value')
-        send_parser = subparsers.add_parser('send', help='Create a Bitwarden Send from a URI')
-        parser.print_help()
+    if args.command not in SUBCOMMANDS:
+        build_parser().print_help()
         sys.exit(1)
     
-    # Set debug mode if requested (argparse will handle flag from either position)
-    setup_logging(debug=args.debug if hasattr(args, 'debug') else False)
-    if hasattr(args, 'debug') and args.debug:
+    setup_logging(debug=args.debug)
+    if args.debug:
         logging.debug("Debug mode enabled")
         logging.debug(f"Command: {args.command}")
-        logging.debug(f"Arguments: {vars(args)}")
         logging.debug(f"Python version: {sys.version}")
         logging.debug(f"Working directory: {os.getcwd()}")
         logging.debug(f"Environment variables containing 'BW': {[k for k in os.environ.keys() if 'BW' in k.upper()]}")
     
     if args.command == 'run':
-        if not hasattr(args, 'cmd_args') or not args.cmd_args:
+        if not args.cmd_args:
             print("Error: No command specified to run", file=sys.stderr)
             sys.exit(1)
         run_command(args)
@@ -904,21 +858,6 @@ def main():
         read_secret(args)
     elif args.command == 'send':
         send_item(args)
-    else:
-        # Show help and exit
-        parser = argparse.ArgumentParser(
-            description="Bitwarden Environment Variable Processor",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=__doc__
-        )
-        parser.add_argument('--no-sync', action='store_true', help='Skip syncing Bitwarden vault before processing')
-        parser.add_argument('--debug', action='store_true', help='Enable debug output')
-        subparsers = parser.add_subparsers(dest='command', help='Available commands')
-        run_parser = subparsers.add_parser('run', help='Run a command with resolved environment variables')
-        read_parser = subparsers.add_parser('read', help='Read a specific secret value')
-        send_parser = subparsers.add_parser('send', help='Create a Bitwarden Send from a URI')
-        parser.print_help()
-        sys.exit(1)
 
 
 if __name__ == '__main__':

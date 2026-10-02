@@ -985,6 +985,46 @@ class TestArgumentParsing(unittest.TestCase):
         self.assertEqual(args.command, 'run')
         self.assertEqual(args.cmd_args, [])
 
+    def _parse(self, *argv):
+        sys.argv = ['bwenv.py', *argv]
+        return bwenv.parse_args_with_separator()
+
+    def test_child_command_may_contain_run(self):
+        """`run -- npm run build` (or docker/cargo/kubectl run) runs that command"""
+        args = self._parse('run', '--', 'npm', 'run', 'build')
+        self.assertEqual((args.command, args.cmd_args), ('run', ['npm', 'run', 'build']))
+
+        args = self._parse('--debug', 'run', '--', 'docker', 'run', 'alpine')
+        self.assertTrue(args.debug)
+        self.assertEqual(args.cmd_args, ['docker', 'run', 'alpine'])
+
+    def test_child_command_may_contain_read_or_send(self):
+        """Without `--`, words after the child command are its arguments, not bwenv subcommands"""
+        self.assertEqual(self._parse('run', 'echo', 'read').cmd_args, ['echo', 'read'])
+        self.assertEqual(self._parse('run', 'make', 'send').cmd_args, ['make', 'send'])
+
+    def test_flags_after_child_command_belong_to_it(self):
+        """`run grep --debug f` passes --debug to grep and leaves bwenv's debug mode off"""
+        args = self._parse('run', 'grep', '--debug', 'f')
+        self.assertFalse(args.debug)
+        self.assertEqual(args.cmd_args, ['grep', '--debug', 'f'])
+
+    def test_only_first_separator_counts(self):
+        """With two `--`, everything after the first goes to the child unchanged"""
+        args = self._parse('run', '--', 'tool', '--debug', '--', 'file')
+        self.assertFalse(args.debug)
+        self.assertEqual(args.cmd_args, ['tool', '--debug', '--', 'file'])
+
+    def test_read_and_send_flags_anywhere(self):
+        """read and send run no child, so bwenv flags may follow the URI"""
+        args = self._parse('read', 'op://vault/item/field', '--debug')
+        self.assertTrue(args.debug)
+        self.assertEqual(args.uri, 'op://vault/item/field')
+
+        args = self._parse('send', '--no-sync', '--name', 'X', 'op://v/i/f', '--max-access', '3')
+        self.assertTrue(args.no_sync)
+        self.assertEqual((args.name, args.uri, args.max_access), ('X', ['op://v/i/f'], 3))
+
 
 class TestFunctional(unittest.TestCase):
     """Functional tests for the complete bwenv workflow"""
