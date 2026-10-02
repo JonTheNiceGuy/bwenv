@@ -1,0 +1,39 @@
+name: Release
+
+# Publish bwenv.py as a GitHub release whenever a tag is pushed.
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Run unit tests
+        run: python -m unittest test_bwenv.py -v
+
+      - name: Build release notes and checksum
+        run: |
+          # Use the matching "- **<tag>**: ..." line from the README changelog, if there is one.
+          grep -F -- "- **${GITHUB_REF_NAME}**:" README.md | sed 's/^- //' > release-notes.md || true
+          sha256sum bwenv.py > bwenv.py.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" bwenv.py bwenv.py.sha256 \
+            --verify-tag \
+            --title "bwenv $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --generate-notes
