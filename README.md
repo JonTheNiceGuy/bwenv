@@ -60,13 +60,18 @@ Reference secrets using one of these supported formats:
 `bw://vault_or_org/folder_or_collection/item_name/field_name`
 
 - `vault_or_org`: Vault name, organization name, or UUID
-- `folder_or_collection`: Folder name, collection name, or UUID (use "myvault" or "unassigned" for personal vault items)
+- `folder_or_collection`: Folder name, collection name, or UUID (use "myvault" or "unassigned" for personal vault items). Optional when the item name is unique.
 - `item_name`: Name of the item containing the secret
 - `field_name`: Field name within the item
 
 **Special identifiers:**
 - Use `myvault` or `unassigned` for personal vault items
 - UUIDs can be used instead of names for more precise targeting
+
+**Folder and collection matching:**
+- The folder (personal vault) or collection (organization) must match exactly: its full name, such as `Demo/Data` for a nested collection, or its UUID. One segment of a nested name does not match.
+- A folder or collection that does not exist is an error; bwenv never falls back to a same-named item elsewhere.
+- Without a folder or collection, the item name must be unique in that vault or organization. If two items share the name, bwenv stops with an error asking for the folder or collection rather than guessing.
 
 ### Examples
 
@@ -251,3 +256,4 @@ This is a community project. For support:
 - **v1.7**: Fixed argument parsing to ensure consistent behavior regardless of flag positions. All flag combinations (`--debug run`, `run --debug`, etc.) now work identically while properly respecting the `--` separator boundary.
 - **v1.8**: Added support for Bitwarden native URI format (`bw://`) alongside existing 1Password-compatible format (`op://`). The new format supports organization/collection paths, personal vault items, and UUID-based targeting for precise item resolution.
 - **v1.9**: Implemented the `send` subcommand to create Bitwarden Sends directly from a URI. It can send a single secret value for field-specific URIs or a JSON object of the entire item for item-only URIs, with an optional `--name flag` for custom titles.
+- **v1.10**: Fixed `bw://` URIs ignoring the folder or collection: the path now selects the item, an unknown folder or collection is an error, and an item name shared by several items is an error unless the path chooses one. Cached the item, organization, folder and collection lists so each runs once per invocation, including a single `bw sync` (thanks to @lewis-lees for the item cache).

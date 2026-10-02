@@ -421,6 +421,7 @@ class TestBitwardenClient(unittest.TestCase):
         commands = [c.args[0] for c in mock_run.call_args_list]
         self.assertEqual(commands.count(['bw', 'list', 'organizations']), 1)
 
+
     def test_get_field_value_custom_field(self):
         """Test getting value from custom field"""
         client = bwenv.BitwardenClient()
@@ -454,6 +455,100 @@ class TestBitwardenClient(unittest.TestCase):
         
         value = client.get_field_value(item, "nonexistent")
         self.assertIsNone(value)
+
+
+class TestBwUriPathResolution(unittest.TestCase):
+    """Test that the folder/collection part of a bw:// URI selects the item"""
+
+    ORG_ID = "org-uuid-1"
+    FOLDERS = [
+        {"id": "folder-prod", "name": "Prod"},
+        {"id": "folder-dev", "name": "Dev"},
+    ]
+    COLLECTIONS = [
+        {"id": "coll-demo-data", "name": "Demo/Data", "organizationId": ORG_ID},
+        {"id": "coll-other", "name": "Other", "organizationId": ORG_ID},
+    ]
+    ORGANIZATIONS = [{"id": ORG_ID, "name": "Example Org"}]
+    ITEMS = [
+        {"id": "p1", "name": "DEMO_DATA", "organizationId": None, "folderId": "folder-prod",
+         "fields": [{"name": "secret", "value": "PROD-VALUE"}]},
+        {"id": "p2", "name": "DEMO_DATA", "organizationId": None, "folderId": "folder-dev",
+         "fields": [{"name": "secret", "value": "DEV-VALUE"}]},
+        {"id": "p3", "name": "ONLY_ONE", "organizationId": None, "folderId": "folder-dev",
+         "fields": [{"name": "prod/plaintext", "value": "A Dummy String"}]},
+        {"id": "o1", "name": "DEMO_DATA", "organizationId": ORG_ID, "collectionIds": ["coll-demo-data"],
+         "fields": [{"name": "secret", "value": "ORG-DEMO-VALUE"}]},
+        {"id": "o2", "name": "DEMO_DATA", "organizationId": ORG_ID, "collectionIds": ["coll-other"],
+         "fields": [{"name": "secret", "value": "ORG-OTHER-VALUE"}]},
+    ]
+
+    def setUp(self):
+        responses = {
+            ('bw', 'status'): '{"status":"unlocked"}',
+            ('bw', 'sync'): 'Syncing complete.',
+            ('bw', 'list', 'items'): json.dumps(self.ITEMS),
+            ('bw', 'list', 'folders'): json.dumps(self.FOLDERS),
+            ('bw', 'list', 'collections'): json.dumps(self.COLLECTIONS),
+            ('bw', 'list', 'organizations'): json.dumps(self.ORGANIZATIONS),
+        }
+        patcher = patch('subprocess.run',
+                        side_effect=lambda command, **kwargs: Mock(stdout=responses.get(tuple(command), "[]"),
+                                                                   returncode=0))
+        self.mock_run = patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        self.client = bwenv.BitwardenClient()
+
+    def test_folder_selects_item(self):
+        """Same-named personal items are told apart by folder"""
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/Dev/DEMO_DATA/secret'), 'DEV-VALUE')
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/Prod/DEMO_DATA/secret'), 'PROD-VALUE')
+
+    def test_folder_by_uuid(self):
+        """A folder can be given by UUID instead of name"""
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/folder-dev/DEMO_DATA/secret'), 'DEV-VALUE')
+
+    def test_unknown_folder_is_not_found(self):
+        """A folder that does not exist must not fall back to any same-named item"""
+        with self.assertRaises(ValueError):
+            self.client.resolve_bw_uri_to_value('bw://myvault/Nonexistent/DEMO_DATA/secret')
+
+    def test_nested_collection_selects_item(self):
+        """A nested collection name (with '/') selects the organization item"""
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://Example Org/Demo/Data/DEMO_DATA/secret'),
+                         'ORG-DEMO-VALUE')
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://Example Org/Other/DEMO_DATA/secret'),
+                         'ORG-OTHER-VALUE')
+
+    def test_partial_collection_name_is_not_a_match(self):
+        """Only the full collection name matches, not one segment of it"""
+        with self.assertRaises(ValueError):
+            self.client.resolve_bw_uri_to_value('bw://Example Org/Data/DEMO_DATA/secret')
+
+    def test_ambiguous_item_without_path_is_an_error(self):
+        """Without a path, two distinct items with the same name must not be picked silently"""
+        with self.assertRaises(ValueError) as ctx:
+            self.client.resolve_bw_uri_to_value('bw://myvault/DEMO_DATA/secret')
+        self.assertIn('DEMO_DATA', str(ctx.exception))
+
+    def test_unique_item_without_path_still_resolves(self):
+        """A uniquely named item resolves without a path, and slashes stay in the field name"""
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/ONLY_ONE/prod/plaintext'),
+                         'A Dummy String')
+
+    def test_folders_and_collections_listed_once(self):
+        """Folder and collection lists are cached across lookups"""
+        self.client.resolve_bw_uri_to_value('bw://myvault/Dev/DEMO_DATA/secret')
+        self.client.resolve_bw_uri_to_value('bw://myvault/Prod/DEMO_DATA/secret')
+        self.client.resolve_bw_uri_to_value('bw://Example Org/Demo/Data/DEMO_DATA/secret')
+        self.client.resolve_bw_uri_to_value('bw://Example Org/Other/DEMO_DATA/secret')
+        commands = [c.args[0] for c in self.mock_run.call_args_list]
+        self.assertEqual(commands.count(['bw', 'list', 'folders']), 1)
+        self.assertEqual(commands.count(['bw', 'list', 'collections']), 1)
+
 
 
 class TestEnvironmentProcessor(unittest.TestCase):

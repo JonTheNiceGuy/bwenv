@@ -23,7 +23,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 def setup_logging(debug: bool = False):
@@ -116,6 +116,8 @@ class BitwardenClient:
         self._op_items_cache = None
         self._bw_items_cache = None
         self._organizations_cache = None
+        self._folders_cache = None
+        self._collections_cache = None
 
     def _run_bw_command(self, args: List[str]) -> str:
         """Run a Bitwarden CLI command and return stdout"""
@@ -441,115 +443,45 @@ class BitwardenClient:
             logging.debug(f"Failed to list organizations: {e}")
             return org_or_vault
     
-    def _resolve_path_constraints(self, org_id: Optional[str], path: str) -> Dict[str, str]:
-        """Resolve path components (folders/collections) to UUIDs"""
-        constraints = {}
+    def _get_folders(self) -> List[Dict]:
+        """Get all personal vault folders, cached for the life of the client"""
+        if self._folders_cache is not None:
+            logging.debug(f"Using cached folders ({len(self._folders_cache)} folders)")
+            return self._folders_cache
+        folders_json = self._run_bw_command(['list', 'folders'])
+        self._folders_cache = json.loads(folders_json)
+        logging.debug(f"Found {len(self._folders_cache)} folders")
+        return self._folders_cache
+    
+    def _get_collections(self) -> List[Dict]:
+        """Get all organization collections, cached for the life of the client"""
+        if self._collections_cache is not None:
+            logging.debug(f"Using cached collections ({len(self._collections_cache)} collections)")
+            return self._collections_cache
+        collections_json = self._run_bw_command(['list', 'collections'])
+        self._collections_cache = json.loads(collections_json)
+        logging.debug(f"Found {len(self._collections_cache)} collections")
+        return self._collections_cache
+    
+    def _resolve_path_ids(self, org_id: Optional[str], path: str) -> Set[str]:
+        """Resolve a path to the IDs of the folders (personal vault) or collections (organization) it names.
         
-        if not path:
-            logging.debug("Empty path, no constraints")
-            return constraints
-        
-        # Split path into components
-        path_parts = [p.strip() for p in path.split('/') if p.strip()]
-        logging.debug(f"Path parts: {path_parts}")
-        
+        Only an exact match counts: the full name (e.g. 'Demo/Data' for a nested collection) or the UUID.
+        """
         if org_id is None:
-            # Personal vault - resolve folders
-            constraints.update(self._resolve_folders(path_parts))
+            containers = self._get_folders()
         else:
-            # Organization vault - resolve collections
-            constraints.update(self._resolve_collections(org_id, path_parts))
+            containers = [c for c in self._get_collections() if c.get('organizationId') == org_id]
         
-        return constraints
-    
-    def _resolve_folders(self, path_parts: List[str]) -> Dict[str, str]:
-        """Resolve folder names to UUIDs for personal vault"""
-        resolved = {}
-        
-        try:
-            folders_json = self._run_bw_command(['list', 'folders'])
-            folders = json.loads(folders_json)
-            logging.debug(f"Found {len(folders)} folders")
-            
-            for folder in folders:
-                folder_name = folder.get('name', '')
-                folder_id = folder.get('id')
-                
-                if folder_name in path_parts and folder_id:
-                    resolved[folder_name] = folder_id
-                    logging.debug(f"Resolved folder '{folder_name}' to ID: {folder_id}")
-                    
-        except Exception as e:
-            logging.debug(f"Failed to list folders: {e}")
-        
+        resolved = {c['id'] for c in containers if c.get('id') and path in (c.get('name'), c.get('id'))}
+        logging.debug(f"Resolved path '{path}' to IDs: {resolved}")
         return resolved
     
-    def _resolve_collections(self, org_id: str, path_parts: List[str]) -> Dict[str, str]:
-        """Resolve collection names to UUIDs for organization vault"""
-        resolved = {}
-        
-        if not path_parts:
-            return resolved
-        
-        try:
-            collections_json = self._run_bw_command(['list', 'collections'])
-            collections = json.loads(collections_json)
-            logging.debug(f"Found {len(collections)} collections")
-            
-            # Reconstruct the full path to try different combinations
-            full_path = '/'.join(path_parts)
-            
-            for collection in collections:
-                collection_name = collection.get('name', '')
-                collection_id = collection.get('id')
-                collection_org_id = collection.get('organizationId')
-                
-                # Only consider collections that belong to our organization
-                if collection_org_id == org_id and collection_name and collection_id:
-                    # Try exact match with full path first
-                    if collection_name == full_path:
-                        resolved[collection_name] = collection_id
-                        logging.debug(f"Resolved collection (exact match) '{collection_name}' to ID: {collection_id}")
-                    # Also try individual parts
-                    elif collection_name in path_parts:
-                        resolved[collection_name] = collection_id
-                        logging.debug(f"Resolved collection (partial match) '{collection_name}' to ID: {collection_id}")
-                        
-        except Exception as e:
-            logging.debug(f"Failed to list collections: {e}")
-        
-        return resolved
-    
-    def _item_matches_constraints(self, item: Dict, org_id: Optional[str], path_constraints: Dict[str, str]) -> bool:
-        """Check if an item matches the organization and path constraints"""
-        # Check organization match
-        item_org_id = item.get('organizationId')
-        if org_id != item_org_id:
-            logging.debug(f"Organization mismatch: expected {org_id}, got {item_org_id}")
-            return False
-        
-        # If no path constraints, we're done
-        if not path_constraints:
-            logging.debug("No path constraints to check")
-            return True
-        
-        # Check folder/collection constraints
-        item_folder_id = item.get('folderId')
-        item_collection_ids = set(item.get('collectionIds', []))
-        constraint_ids = set(path_constraints.values())
-        
-        # Item matches if its folder or any of its collections match our constraints
-        if item_folder_id and item_folder_id in constraint_ids:
-            logging.debug(f"Item folder {item_folder_id} matches constraints")
-            return True
-        
-        if item_collection_ids.intersection(constraint_ids):
-            matching_collections = item_collection_ids.intersection(constraint_ids)
-            logging.debug(f"Item collections {matching_collections} match constraints")
-            return True
-        
-        logging.debug(f"Item folder/collections do not match path constraints")
-        return False
+    def _item_in_containers(self, item: Dict, org_id: Optional[str], container_ids: Set[str]) -> bool:
+        """Check if an item is in one of the given folders (personal vault) or collections (organization)"""
+        if org_id is None:
+            return item.get('folderId') in container_ids
+        return bool(set(item.get('collectionIds') or []) & container_ids)
     
     def resolve_bw_uri_to_value(self, uri: str) -> str:
         """Resolve a complete bw:// URI to its field value using step-by-step resolution"""
@@ -612,31 +544,37 @@ class BitwardenClient:
         
         logging.debug(f"Found {len(candidate_items)} items matching organization constraint")
         
-        # Try different splits of parts to find item_name + field_name
-        # Work backwards: last part could be field, second-to-last might be item name
+        # Try different splits of parts into path / item_name / field_name.
+        # Everything before the item name is the folder (personal vault) or collection (organization).
         for split_point in range(1, len(parts) + 1):  # Try different split points, including full length
+            potential_path = '/'.join(parts[:split_point - 1])
             potential_item_name = parts[split_point - 1]
             potential_field_name = '/'.join(parts[split_point:]) if split_point < len(parts) else ""
-            
-            logging.debug(f"Trying item_name='{potential_item_name}', field_name='{potential_field_name}'")
-            
-            # Look for this item name in our candidates
-            for item in candidate_items:
-                if item.get('name') == potential_item_name:
-                    logging.debug(f"Found potential item match: {potential_item_name}")
-                    
-                    if potential_field_name:
-                        # Check if this item has the field
-                        if self.get_field_value(item, potential_field_name) is not None:
-                            logging.debug(f"Item has field '{potential_field_name}' - match found!")
-                            return item, potential_field_name
-                        else:
-                            logging.debug(f"Item does not have field '{potential_field_name}' - continuing search")
-                    else:
-                        # No field name - this is an item-only match
-                        logging.debug(f"Item match without field - returning item")
-                        return item, ""
-        
+
+            logging.debug(f"Trying path='{potential_path}', item_name='{potential_item_name}', field_name='{potential_field_name}'")
+
+            matches = [item for item in candidate_items if item.get('name') == potential_item_name]
+            if not matches:
+                continue
+            logging.debug(f"Found {len(matches)} item(s) named '{potential_item_name}'")
+
+            if potential_path:
+                container_ids = self._resolve_path_ids(org_id, potential_path)
+                matches = [item for item in matches if self._item_in_containers(item, org_id, container_ids)]
+                logging.debug(f"{len(matches)} item(s) in '{potential_path}'")
+
+            if potential_field_name:
+                matches = [item for item in matches if self.get_field_value(item, potential_field_name) is not None]
+                logging.debug(f"{len(matches)} item(s) have field '{potential_field_name}'")
+
+            if len(matches) > 1:
+                where = f"'{potential_path}'" if potential_path else "this vault"
+                raise ValueError(f"{len(matches)} items named '{potential_item_name}' match in {where}; "
+                                 f"add the folder or collection to the URI to choose one")
+            if matches:
+                logging.debug("Match found!")
+                return matches[0], potential_field_name
+
         logging.debug("No matching item found")
         return None, ""
     
