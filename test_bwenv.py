@@ -305,7 +305,7 @@ class TestBitwardenClient(unittest.TestCase):
                 return Mock(stdout='{"status":"unlocked"}', returncode=0)
             elif command == ['bw', 'sync']:
                 return Mock(stdout="Syncing complete.", returncode=0)
-            elif command == ['bw', 'list', 'items', '--search', 'op://']:
+            elif command == ['bw', 'list', 'items']:
                 return Mock(stdout=json.dumps(self.sample_items), returncode=0)
             else:
                 return Mock(stdout="", returncode=0)
@@ -330,7 +330,7 @@ class TestBitwardenClient(unittest.TestCase):
                 return Mock(stdout='{"status":"unlocked"}', returncode=0)
             elif command == ['bw', 'sync']:
                 return Mock(stdout="Syncing complete.", returncode=0)
-            elif command == ['bw', 'list', 'items', '--search', 'op://']:
+            elif command == ['bw', 'list', 'items']:
                 return Mock(stdout=json.dumps(self.sample_items), returncode=0)
             else:
                 return Mock(stdout="", returncode=0)
@@ -343,7 +343,7 @@ class TestBitwardenClient(unittest.TestCase):
         # Should call status validation, sync, then list items
         mock_run.assert_any_call(['bw', 'status'], capture_output=True, text=True, check=True)
         mock_run.assert_any_call(['bw', 'sync'], capture_output=True, text=True, check=True)
-        mock_run.assert_any_call(['bw', 'list', 'items', '--search', 'op://'], capture_output=True, text=True, check=True)
+        mock_run.assert_any_call(['bw', 'list', 'items'], capture_output=True, text=True, check=True)
     
     @patch('subprocess.run')
     @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
@@ -355,7 +355,7 @@ class TestBitwardenClient(unittest.TestCase):
                 return Mock(stdout='{"status":"unlocked"}', returncode=0)
             elif command == ['bw', 'sync']:
                 return Mock(stdout="Syncing complete.", returncode=0)
-            elif command == ['bw', 'list', 'items', '--search', 'op://']:
+            elif command == ['bw', 'list', 'items']:
                 return Mock(stdout=json.dumps(self.sample_items), returncode=0)
             else:
                 return Mock(stdout="", returncode=0)
@@ -392,6 +392,53 @@ class TestBitwardenClient(unittest.TestCase):
         client = bwenv.BitwardenClient()
         self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/secret'), 'secret_value')
         self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/username'), 'testuser')
+
+        commands = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(commands.count(['bw', 'sync']), 1)
+        self.assertEqual(commands.count(['bw', 'list', 'items']), 1)
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_op_uris_found_when_bw_search_ignores_uris(self, mock_run):
+        """op:// items are found by filtering all items locally, not via `bw list items --search`.
+
+        bw 2026.9.1's --search no longer matches website URIs, so searching for 'op://' returns nothing.
+        """
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'list', 'items']:
+                return Mock(stdout=json.dumps(self.sample_items), returncode=0)
+            else:  # including any `--search` call: behave like the current bw CLI
+                return Mock(stdout="[]", returncode=0)
+
+        mock_run.side_effect = mock_command_response
+
+        client = bwenv.BitwardenClient(no_sync=True)
+        item = client.find_item_by_uri_prefix("Employee", "example")
+        self.assertIsNotNone(item)
+        self.assertEqual(item['id'], 'item1')
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_op_and_bw_uris_share_one_item_fetch(self, mock_run):
+        """Mixing op:// and bw:// lookups syncs and lists items only once"""
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'sync']:
+                return Mock(stdout="Syncing complete.", returncode=0)
+            elif command == ['bw', 'list', 'items']:
+                return Mock(stdout=json.dumps(self.sample_items), returncode=0)
+            else:
+                return Mock(stdout="[]", returncode=0)
+
+        mock_run.side_effect = mock_command_response
+
+        client = bwenv.BitwardenClient()
+        self.assertIsNotNone(client.find_item_by_uri_prefix("Employee", "example"))
+        self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/secret'), 'secret_value')
+        self.assertIsNotNone(client.find_item_by_uri_prefix("Employee", "example"))
 
         commands = [c.args[0] for c in mock_run.call_args_list]
         self.assertEqual(commands.count(['bw', 'sync']), 1)

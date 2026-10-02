@@ -113,8 +113,8 @@ class BitwardenClient:
     
     def __init__(self, no_sync: bool = False):
         self.sync = not no_sync
+        self._items_cache = None
         self._op_items_cache = None
-        self._bw_items_cache = None
         self._organizations_cache = None
         self._folders_cache = None
         self._collections_cache = None
@@ -328,27 +328,37 @@ class BitwardenClient:
         sync_duration = __import__('time').time() - sync_start_time
         logging.debug(f"Vault sync completed in {sync_duration:.2f} seconds")
     
+    def _get_all_items(self) -> List[Dict]:
+        """Get every item in the vault, syncing first, cached for the life of the client"""
+        if self._items_cache is not None:
+            logging.debug(f"Using cached items ({len(self._items_cache)} items)")
+            return self._items_cache
+
+        if self.sync:
+            self.sync_vault()
+
+        items_json = self._run_bw_command(['list', 'items'])
+        self._items_cache = json.loads(items_json)
+        logging.debug(f"Found {len(self._items_cache)} total items")
+        logging.debug(f"Items JSON length: {len(items_json)} characters")
+        return self._items_cache
+
     def get_items_with_op_uris(self) -> List[Dict]:
         """Get all Bitwarden items that have URIs starting with 'op://'"""
         if self._op_items_cache is not None:
-            logging.debug(f"Using cached items ({len(self._op_items_cache)} items)")
+            logging.debug(f"Using cached op:// items ({len(self._op_items_cache)} items)")
             return self._op_items_cache
-        
+
         logging.debug("Fetching Bitwarden items with op:// URIs...")
-        
-        if self.sync:
-            self.sync_vault()
-        
-        # Get all items in JSON format
-        items_json = self._run_bw_command(['list', 'items', '--search', 'op://'])
-        items = json.loads(items_json)
-        logging.debug(f"Found {len(items)} items from search")
-        logging.debug(f"Items JSON length: {len(items_json)} characters")
-        
+
+        # Filter locally: `bw list items --search` no longer matches website URIs (bw 2026.9.1),
+        # so searching for 'op://' would find nothing.
+        items = self._get_all_items()
+
         # Filter items that have URIs starting with 'op://'
         op_items = []
         for item in items:
-            if 'login' in item and item['login'] and 'uris' in item['login']:
+            if item.get('login') and item['login'].get('uris'):
                 for uri_obj in item['login']['uris']:
                     if uri_obj.get('uri', '').startswith('op://'):
                         op_items.append(item)
@@ -523,17 +533,7 @@ class BitwardenClient:
         """Try different combinations of parts to find an item with the field"""
         logging.debug(f"Searching for item with org_id={org_id} and parts={parts}")
         
-        # Get all items
-        if self._bw_items_cache is not None:
-            logging.debug(f"Using cached items ({len(self._bw_items_cache)} items)")
-            items = self._bw_items_cache
-        else:
-            if self.sync:
-                self.sync_vault()
-            items_json = self._run_bw_command(['list', 'items'])
-            items = json.loads(items_json)
-            logging.debug(f"Found {len(items)} total items to search")
-            self._bw_items_cache = items
+        items = self._get_all_items()
 
         # Filter items by organization first
         candidate_items = []
