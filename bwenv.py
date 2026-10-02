@@ -115,6 +115,7 @@ class BitwardenClient:
         self.sync = not no_sync
         self._op_items_cache = None
         self._bw_items_cache = None
+        self._organizations_cache = None
 
     def _run_bw_command(self, args: List[str]) -> str:
         """Run a Bitwarden CLI command and return stdout"""
@@ -404,41 +405,6 @@ class BitwardenClient:
         logging.debug(f"Field '{field_path}' not found in item")
         return None
     
-    def find_item_by_bw_uri(self, org_or_vault: str, path: str, item_name: str) -> Optional[Dict]:
-        """Find a Bitwarden item by bw:// URI components"""
-        logging.debug(f"Searching for item with bw:// URI - org/vault: {org_or_vault}, path: {path}, item: {item_name}")
-        
-        if self.sync:
-            self.sync_vault()
-        
-        # Step 1: Resolve organization name to UUID if needed
-        org_id = self._resolve_organization(org_or_vault)
-        logging.debug(f"Resolved org/vault '{org_or_vault}' to ID: {org_id}")
-        
-        # Step 2: Resolve path (folders/collections) to UUIDs
-        path_constraints = self._resolve_path_constraints(org_id, path)
-        logging.debug(f"Resolved path constraints: {path_constraints}")
-        
-        # Step 3: Get all items and find matching one
-        items_json = self._run_bw_command(['list', 'items'])
-        items = json.loads(items_json)
-        logging.debug(f"Found {len(items)} total items for bw:// search")
-        
-        # Search for item by name and constraints
-        for item in items:
-            if item.get('name') == item_name:
-                logging.debug(f"Found matching item name: {item_name}")
-                logging.debug(f"Item details - org: {item.get('organizationId')}, collection: {item.get('collectionIds', [])}, folder: {item.get('folderId')}")
-                
-                if self._item_matches_constraints(item, org_id, path_constraints):
-                    logging.debug(f"Item matches all constraints")
-                    return item
-                else:
-                    logging.debug(f"Item does not match constraints")
-        
-        logging.debug(f"No item found matching bw:// URI components")
-        return None
-    
     def _resolve_organization(self, org_or_vault: str) -> Optional[str]:
         """Resolve organization name to UUID, return None for personal vault"""
         if org_or_vault in ['myvault', 'unassigned']:
@@ -452,9 +418,14 @@ class BitwardenClient:
         
         try:
             # List organizations to resolve name to UUID
-            orgs_json = self._run_bw_command(['list', 'organizations'])
-            organizations = json.loads(orgs_json)
-            logging.debug(f"Found {len(organizations)} organizations")
+            if self._organizations_cache is not None:
+                logging.debug(f"Using cached organizations ({len(self._organizations_cache)} organizations)")
+                organizations = self._organizations_cache
+            else:
+                orgs_json = self._run_bw_command(['list', 'organizations'])
+                organizations = json.loads(orgs_json)
+                logging.debug(f"Found {len(organizations)} organizations")
+                self._organizations_cache = organizations
             
             for org in organizations:
                 if org.get('name') == org_or_vault:
@@ -939,8 +910,7 @@ class EnvironmentProcessor:
         
         logging.debug(f"Resolving bw:// URI: {uri}")
         
-        # The actual parsing and resolution will be handled by find_item_by_bw_uri
-        # which will do the step-by-step org/collection/folder resolution
+        # Parsing and resolution are handled by BitwardenClient.resolve_bw_uri_to_value
         try:
             value = self.bw_client.resolve_bw_uri_to_value(uri)
             logging.debug(f"Successfully resolved bw:// URI {uri} to value (length: {len(value)} chars)")

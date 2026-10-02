@@ -397,6 +397,30 @@ class TestBitwardenClient(unittest.TestCase):
         self.assertEqual(commands.count(['bw', 'sync']), 1)
         self.assertEqual(commands.count(['bw', 'list', 'items']), 1)
 
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_organizations_cached_across_lookups(self, mock_run):
+        """Test that resolving organization names lists organizations only once"""
+        organizations = [{"id": "org-uuid-1", "name": "Example Org"}]
+
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'list', 'organizations']:
+                return Mock(stdout=json.dumps(organizations), returncode=0)
+            else:
+                return Mock(stdout="[]", returncode=0)
+
+        mock_run.side_effect = mock_command_response
+
+        client = bwenv.BitwardenClient()
+        self.assertEqual(client._resolve_organization('Example Org'), 'org-uuid-1')
+        self.assertEqual(client._resolve_organization('Example Org'), 'org-uuid-1')
+        self.assertIsNone(client._resolve_organization('myvault'))
+
+        commands = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(commands.count(['bw', 'list', 'organizations']), 1)
+
     def test_get_field_value_custom_field(self):
         """Test getting value from custom field"""
         client = bwenv.BitwardenClient()
