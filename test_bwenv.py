@@ -3,7 +3,11 @@
 Unit tests for bwenv script
 """
 
+import argparse
+import base64
+import datetime
 import json
+import logging
 import os
 import subprocess
 import unittest
@@ -638,7 +642,7 @@ class TestBwUriPathResolution(unittest.TestCase):
 
     def test_unknown_folder_is_not_found(self):
         """A folder that does not exist must not fall back to any same-named item"""
-        with self.assertRaises(ValueError):
+        with self.assertRaises(bwenv.BWEnvError):
             self.client.resolve_bw_uri_to_value('bw://myvault/Nonexistent/DEMO_DATA/secret')
 
     def test_nested_collection_selects_item(self):
@@ -650,12 +654,12 @@ class TestBwUriPathResolution(unittest.TestCase):
 
     def test_partial_collection_name_is_not_a_match(self):
         """Only the full collection name matches, not one segment of it"""
-        with self.assertRaises(ValueError):
+        with self.assertRaises(bwenv.BWEnvError):
             self.client.resolve_bw_uri_to_value('bw://Example Org/Data/DEMO_DATA/secret')
 
     def test_ambiguous_item_without_path_is_an_error(self):
         """Without a path, two distinct items with the same name must not be picked silently"""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(bwenv.BWEnvError) as ctx:
             self.client.resolve_bw_uri_to_value('bw://myvault/DEMO_DATA/secret')
         self.assertIn('DEMO_DATA', str(ctx.exception))
 
@@ -984,107 +988,145 @@ class TestFunctional(unittest.TestCase):
 
 
 class TestSendCommand(unittest.TestCase):
-    """Test cases for the send command functionality"""
-    
+    """End-to-end tests of `bwenv send`, with only the bw CLI mocked"""
+
+    SECRET = 'S3cr3t-Value-Do-Not-Log'
+    ITEMS = [
+        {"id": "i1", "name": "svc", "organizationId": None, "folderId": None,
+         "login": {"username": "svc-user", "password": SECRET, "uris": [{"uri": "op://Prod/svc"}]},
+         "fields": [{"name": "api_key", "value": "key-123"}]},
+        {"id": "i2", "name": "dup", "organizationId": None, "folderId": "f1",
+         "login": {"password": "a"}, "fields": []},
+        {"id": "i3", "name": "dup", "organizationId": None, "folderId": "f2",
+         "login": {"password": "b"}, "fields": []},
+    ]
+
     def setUp(self):
-        """Set up mocks for Bitwarden client"""
-        self.bw_client = bwenv.BitwardenClient(no_sync=True)
-    
-    def test_uri_has_field_op_uri(self):
-        """Test _uri_has_field method with op:// URI"""
-        # URI with field should return True
-        self.assertTrue(self.bw_client._uri_has_field("op://Employee/example/secret"))
-        
-        # URI with nested field should return True  
-        self.assertTrue(self.bw_client._uri_has_field("op://Employee/example/prod/token"))
-    
-    @patch.object(bwenv.BitwardenClient, 'resolve_bw_uri_to_value')
-    def test_uri_has_field_bw_uri(self, mock_resolve):
-        """Test _uri_has_field method with bw:// URI"""
-        # Mock successful resolution for field URI
-        mock_resolve.return_value = "some_value"
-        self.assertTrue(self.bw_client._uri_has_field("bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext"))
-        
-        # Mock failed resolution for item URI (no field)
-        mock_resolve.side_effect = Exception("No field")
-        self.assertFalse(self.bw_client._uri_has_field("bw://myvault/Demo/DEMO_DATA"))
-    
-    @patch.object(bwenv.BitwardenClient, '_create_bw_send_with_json')
-    def test_create_field_send(self, mock_create_send):
-        """Test creating a send for a specific field"""
-        mock_create_send.return_value = "https://send.bitwarden.com/test-url"
-        
-        # Mock the EnvironmentProcessor to return a test value
-        with patch.object(bwenv.EnvironmentProcessor, '_resolve_op_uri', return_value='test_secret_value'):
-            result = self.bw_client._create_field_send("op://Employee/example/secret", "Test Send")
-        
-        # Verify the send was created with correct JSON structure
-        mock_create_send.assert_called_once()
-        call_args = mock_create_send.call_args[0][0]
-        self.assertEqual(call_args['name'], 'Test Send')
-        self.assertEqual(call_args['text']['text'], 'test_secret_value')
-        self.assertEqual(call_args['type'], 0)
-        self.assertEqual(result, "https://send.bitwarden.com/test-url")
-    
-    @patch.object(bwenv.BitwardenClient, '_create_bw_send_with_json')
-    @patch.object(bwenv.BitwardenClient, '_find_item_from_uri')
-    def test_create_item_send(self, mock_find_item, mock_create_send):
-        """Test creating a send for a full item"""
-        mock_create_send.return_value = "https://send.bitwarden.com/test-item-url"
-        
-        # Mock item data
-        mock_item = {
-            'name': 'test-item',
-            'login': {
-                'username': 'test_user',
-                'password': 'test_pass'
-            },
-            'fields': [
-                {'name': 'api_key', 'value': 'secret_key_123'},
-                {'name': 'env', 'value': 'production'}
-            ]
+        self.responses = {
+            ('bw', 'list', 'items'): json.dumps(self.ITEMS),
+            ('bw', 'send', 'create'): json.dumps({"accessUrl": "https://vault.example/#/send/abc"}),
         }
-        mock_find_item.return_value = mock_item
-        
-        result = self.bw_client._create_item_send("op://Employee/example", "Item Send")
-        
-        # Verify the send was created with correct JSON structure
-        mock_create_send.assert_called_once()
-        call_args = mock_create_send.call_args[0][0]
-        self.assertEqual(call_args['name'], 'Item Send')
-        self.assertEqual(call_args['type'], 0)
-        
-        # Verify JSON content contains expected fields
-        json_content = call_args['text']['text']
-        parsed_json = json.loads(json_content)
-        self.assertEqual(parsed_json['username'], 'test_user')
-        self.assertEqual(parsed_json['password'], 'test_pass')
-        self.assertEqual(parsed_json['api_key'], 'secret_key_123')
-        self.assertEqual(parsed_json['env'], 'production')
-        
-        self.assertEqual(result, "https://send.bitwarden.com/test-item-url")
-    
-    @patch.object(bwenv.BitwardenClient, '_uri_has_field', return_value=True)
-    @patch.object(bwenv.BitwardenClient, '_create_field_send')
-    def test_send_item_with_field(self, mock_create_field, mock_has_field):
-        """Test send_item method when URI has a field"""
-        mock_create_field.return_value = "https://send.bitwarden.com/field-url"
-        
-        result = self.bw_client.send_item("op://Employee/example/secret", "Field Send")
-        
-        mock_create_field.assert_called_with("op://Employee/example/secret", "Field Send")
-        self.assertEqual(result, "https://send.bitwarden.com/field-url")
-    
-    @patch.object(bwenv.BitwardenClient, '_uri_has_field', return_value=False)
-    @patch.object(bwenv.BitwardenClient, '_create_item_send')
-    def test_send_item_without_field(self, mock_create_item, mock_has_field):
-        """Test send_item method when URI has no field"""
-        mock_create_item.return_value = "https://send.bitwarden.com/item-url"
-        
-        result = self.bw_client.send_item("bw://myvault/Demo/DEMO_DATA", "Item Send")
-        
-        mock_create_item.assert_called_with("bw://myvault/Demo/DEMO_DATA", "Item Send")
-        self.assertEqual(result, "https://send.bitwarden.com/item-url")
+        patcher = patch('subprocess.run', side_effect=lambda command, **kwargs: fake_bw(self.responses)(command, **kwargs))
+        self.mock_run = patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+    def _send(self, *uris, **options):
+        args = argparse.Namespace(uri=list(uris), no_sync=True, name=options.get('name'),
+                    max_access=options.get('max_access', 1), expire_hours=options.get('expire_hours', 24.0))
+        with patch('builtins.print') as mock_print, self.assertLogs(level='DEBUG') as logs:
+            logging.getLogger().debug("send test start")
+            bwenv.send_item(args)
+        return [c.args[0] for c in mock_print.call_args_list], '\n'.join(logs.output)
+
+    def _created_sends(self):
+        sends = []
+        for call in self.mock_run.call_args_list:
+            if call.args[0][1:3] == ['send', 'create']:
+                self.assertEqual(call.args[0], ['bw', 'send', 'create'], "payload must not be on the command line")
+                sends.append(json.loads(base64.b64decode(call.kwargs['input'])))
+        return sends
+
+    def test_field_send_goes_through_stdin_with_safe_defaults(self):
+        """The secret reaches bw on stdin only, and the Send is single-use, hidden and anonymous"""
+        printed, logs = self._send('op://Prod/svc/password')
+
+        self.assertEqual(printed, ["https://vault.example/#/send/abc"])
+        [send] = self._created_sends()
+        self.assertEqual(send['text']['text'], self.SECRET)
+        self.assertTrue(send['text']['hidden'])
+        self.assertTrue(send['hideEmail'])
+        self.assertEqual(send['maxAccessCount'], 1)
+        self.assertEqual(send['name'], 'Shared secret')
+        self.assertNotIn(['bw', 'encode'], [c.args[0] for c in self.mock_run.call_args_list])
+        self.assertNotIn(self.SECRET, logs)
+        self.assertNotIn(base64.b64encode(self.SECRET.encode()).decode()[:16], logs)
+
+    def test_item_send_for_op_uri_without_field(self):
+        """op://vault/item sends the whole item as JSON"""
+        self._send('op://Prod/svc')
+
+        [send] = self._created_sends()
+        self.assertEqual(json.loads(send['text']['text']),
+                         {"username": "svc-user", "password": self.SECRET, "api_key": "key-123"})
+
+    def test_item_send_for_bw_uri_without_field(self):
+        """bw://vault/item sends the whole item as JSON"""
+        self._send('bw://myvault/svc')
+
+        [send] = self._created_sends()
+        self.assertEqual(json.loads(send['text']['text'])['api_key'], 'key-123')
+
+    def test_options_loosen_the_defaults(self):
+        """--max-access 0 means unlimited, --expire-hours sets the deletion date, --name the title"""
+        before = datetime.datetime.now(datetime.timezone.utc)
+        self._send('op://Prod/svc/password', name='For Sam', max_access=0, expire_hours=2)
+
+        [send] = self._created_sends()
+        self.assertIsNone(send['maxAccessCount'])
+        self.assertEqual(send['name'], 'For Sam')
+        deletion = datetime.datetime.strptime(send['deletionDate'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(
+            tzinfo=datetime.timezone.utc)
+        self.assertAlmostEqual((deletion - before).total_seconds(), 7200, delta=60)
+
+    def test_several_uris_are_numbered_not_named_after_the_uri(self):
+        """The Send name never reveals the reference"""
+        printed, _ = self._send('op://Prod/svc/password', 'op://Prod/svc/api_key', name='Creds')
+
+        self.assertEqual([s['name'] for s in self._created_sends()], ['Creds (1 of 2)', 'Creds (2 of 2)'])
+        self.assertEqual(len(printed), 2)
+
+    def test_ambiguous_uri_exits_cleanly(self):
+        """An ambiguous name is a clean error (exit 1), not a traceback, and creates no Send"""
+        with self.assertRaises(SystemExit) as cm:
+            self._send('bw://myvault/dup/password')
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(self._created_sends(), [])
+
+    def test_missing_access_url_is_an_error_and_not_echoed(self):
+        """If bw returns no access URL, bwenv reports it without printing bw's output (it holds the secret)"""
+        self.responses[('bw', 'send', 'create')] = json.dumps({"text": {"text": self.SECRET}})
+
+        with patch('sys.stderr') as mock_stderr, self.assertRaises(SystemExit):
+            self._send('op://Prod/svc/password')
+
+        written = ''.join(str(c.args[0]) for c in mock_stderr.write.call_args_list)
+        self.assertNotIn(self.SECRET, written)
+
+
+class TestSecretHandling(unittest.TestCase):
+    """Secrets never reach logs, and the child of `run` gets no Bitwarden credentials"""
+
+    SECRET = 'S3cr3t-Value-Do-Not-Log'
+    ITEMS = [{"id": "i1", "name": "svc", "organizationId": None, "folderId": None,
+              "login": {"password": SECRET, "uris": [{"uri": "op://Prod/svc"}]}, "fields": []}]
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_debug_logs_never_contain_secret_values(self, mock_run):
+        """--debug logs lengths only, for op://, bw:// and read"""
+        mock_run.side_effect = fake_bw({('bw', 'list', 'items'): json.dumps(self.ITEMS)})
+        processor = bwenv.EnvironmentProcessor(bwenv.BitwardenClient(no_sync=True))
+
+        with self.assertLogs(level='DEBUG') as logs, patch('builtins.print'):
+            self.assertEqual(processor.resolve_uri('op://Prod/svc/password'), self.SECRET)
+            self.assertEqual(processor.resolve_uri('bw://myvault/svc/password'), self.SECRET)
+            bwenv.read_secret(Mock(uri='op://Prod/svc/password', no_sync=True))
+
+        self.assertNotIn(self.SECRET[:8], '\n'.join(logs.output))
+
+    @patch.dict(os.environ, {'BW_SESSION': 'session', 'BW_PASSWORD': 'pw', 'BW_CLIENTID': 'id',
+                             'BW_CLIENTSECRET': 'secret', 'KEEP_ME': 'yes'}, clear=True)
+    def test_run_child_gets_no_bitwarden_credentials(self):
+        """The command bwenv runs cannot use our session to read the rest of the vault"""
+        processor = bwenv.EnvironmentProcessor(Mock())
+
+        env = processor.create_resolved_environment()
+
+        self.assertEqual(env, {'KEEP_ME': 'yes'})
 
 
 class TestSendCommandIntegration(unittest.TestCase):
