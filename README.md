@@ -21,7 +21,35 @@ A cross-platform command-line tool that replaces environment variables containin
 
 ## Installation
 
-1. Download `bwenv.py` from this repository
+Every release on the [releases page](https://github.com/JonTheNiceGuy/bwenv/releases) carries `bwenv.py`
+and its `bwenv.py.sha256` checksum. Install it whichever way suits you.
+
+### Homebrew (macOS and Linux)
+
+```bash
+brew install JonTheNiceGuy/bwenv/bwenv
+```
+
+This installs `bwenv` with the Bitwarden CLI as a dependency, from the
+[JonTheNiceGuy/homebrew-bwenv](https://github.com/JonTheNiceGuy/homebrew-bwenv) tap, which is updated
+automatically on each release. Upgrade with `brew update && brew upgrade bwenv`.
+
+### bin
+
+With [marcosnils/bin](https://github.com/marcosnils/bin), which installs and updates binaries straight from
+GitHub releases:
+
+```bash
+bin install github.com/JonTheNiceGuy/bwenv ~/.local/bin/bwenv
+```
+
+Give the destination path so the command is called `bwenv` rather than `bwenv.py`. `bin update` picks up
+new releases. You need the [Bitwarden CLI](https://bitwarden.com/help/cli/) installed separately.
+
+### Manually
+
+1. Download `bwenv.py` from the [latest release](https://github.com/JonTheNiceGuy/bwenv/releases/latest)
+   (and check it with `sha256sum -c bwenv.py.sha256`)
 2. Make it executable: `chmod +x bwenv.py`
 3. Optionally, rename to `bwenv` and place in your PATH for easier access
 

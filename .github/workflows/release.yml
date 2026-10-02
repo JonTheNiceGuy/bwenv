@@ -1,16 +1,23 @@
 name: Release
 
-# Publish bwenv.py as a GitHub release whenever a tag is pushed.
+# Publish bwenv.py as a GitHub release whenever a tag is pushed, then update the Homebrew tap.
+# Run it by hand (workflow_dispatch) to re-point the tap at an existing release without releasing again.
 on:
   push:
     tags:
       - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to point the Homebrew formula at (e.g. v1.11)"
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -37,3 +44,48 @@ jobs:
             --title "bwenv $GITHUB_REF_NAME" \
             --notes-file release-notes.md \
             --generate-notes
+
+  homebrew:
+    # Point the Homebrew formula at the new release. The tap's own CI then installs, tests and audits it.
+    needs: release
+    if: always() && (needs.release.result == 'success' || (needs.release.result == 'skipped' && github.event_name == 'workflow_dispatch'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Download the released bwenv.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p bwenv.py -p bwenv.py.sha256
+          sha256sum -c bwenv.py.sha256
+
+      - uses: actions/checkout@v7
+        with:
+          repository: JonTheNiceGuy/homebrew-bwenv
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Update the formula
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/bwenv.py"
+          sha256="$(cut -d' ' -f1 bwenv.py.sha256)"
+          sed -i -E \
+            -e "s|^(  url ).*|\1\"${url}\"|" \
+            -e "s|^(  sha256 ).*|\1\"${sha256}\"|" \
+            tap/Formula/bwenv.rb
+          grep -E '^  (url|sha256) ' tap/Formula/bwenv.rb
+
+      - name: Push to the tap
+        working-directory: tap
+        run: |
+          if git diff --quiet; then
+            echo "Formula already points at ${TAG}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "bwenv ${TAG#v}"
+          git push
