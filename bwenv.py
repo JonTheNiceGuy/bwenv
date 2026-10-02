@@ -620,14 +620,13 @@ class BitwardenClient:
         """Try different combinations of parts to find an item with the field"""
         logging.debug(f"Searching for item with org_id={org_id} and parts={parts}")
         
-        if self.sync:
-            self.sync_vault()
-
         # Get all items
         if self._bw_items_cache is not None:
             logging.debug(f"Using cached items ({len(self._bw_items_cache)} items)")
             items = self._bw_items_cache
         else:
+            if self.sync:
+                self.sync_vault()
             items_json = self._run_bw_command(['list', 'items'])
             items = json.loads(items_json)
             logging.debug(f"Found {len(items)} total items to search")

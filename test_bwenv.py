@@ -372,7 +372,31 @@ class TestBitwardenClient(unittest.TestCase):
         # Try to find non-existing item - this uses the cache so shouldn't trigger more calls
         item = client.find_item_by_uri_prefix("NonExistent", "item")
         self.assertIsNone(item)
-    
+
+    @patch('subprocess.run')
+    @patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+    def test_bw_uri_items_cached_across_lookups(self, mock_run):
+        """Test that several bw:// lookups sync and list items only once"""
+        def mock_command_response(command, **kwargs):
+            if command == ['bw', 'status']:
+                return Mock(stdout='{"status":"unlocked"}', returncode=0)
+            elif command == ['bw', 'sync']:
+                return Mock(stdout="Syncing complete.", returncode=0)
+            elif command == ['bw', 'list', 'items']:
+                return Mock(stdout=json.dumps(self.sample_items), returncode=0)
+            else:
+                return Mock(stdout="[]", returncode=0)
+
+        mock_run.side_effect = mock_command_response
+
+        client = bwenv.BitwardenClient()
+        self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/secret'), 'secret_value')
+        self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Test Item 1/username'), 'testuser')
+
+        commands = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(commands.count(['bw', 'sync']), 1)
+        self.assertEqual(commands.count(['bw', 'list', 'items']), 1)
+
     def test_get_field_value_custom_field(self):
         """Test getting value from custom field"""
         client = bwenv.BitwardenClient()
