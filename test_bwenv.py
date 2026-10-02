@@ -22,6 +22,9 @@ sys.path.insert(0, script_dir)
 # Import the bwenv module
 import bwenv
 
+# Never open a real password dialog from the tests; dialog tests opt back in explicitly
+os.environ.setdefault('BWENV_PROMPT', 'tty')
+
 
 def fake_bw(responses):
     """A subprocess.run side effect that behaves like the bw CLI.
@@ -677,6 +680,188 @@ class TestBwUriPathResolution(unittest.TestCase):
         self.assertEqual(commands.count(['bw', 'list', 'folders']), 1)
         self.assertEqual(commands.count(['bw', 'list', 'collections']), 1)
 
+
+
+class TestPasswordDialog(unittest.TestCase):
+    """Choosing and driving the desktop password dialog"""
+
+    def _which(self, *available):
+        return lambda name: f'/usr/bin/{name}' if name in available else None
+
+    def test_macos_uses_osascript_with_hidden_answer(self):
+        with patch.object(bwenv.sys, 'platform', 'darwin'), patch('shutil.which', self._which('osascript')):
+            command = bwenv.password_dialog_command('Master password:')
+        self.assertEqual(command[:2], ['/usr/bin/osascript', '-e'])
+        self.assertIn('with hidden answer', command[2])
+        self.assertIn('"Master password:"', command[2])
+
+    def test_windows_uses_a_masked_powershell_form(self):
+        with patch.object(bwenv, 'IS_WINDOWS', True), patch.object(bwenv.sys, 'platform', 'win32'), \
+                patch('shutil.which', self._which('powershell')):
+            command = bwenv.password_dialog_command("Master password, it's needed:")
+        self.assertEqual(command[0], '/usr/bin/powershell')
+        self.assertIn('UseSystemPasswordChar', command[-1])
+        self.assertIn("'Master password, it''s needed:'", command[-1])  # single quotes escaped
+
+    @patch.dict(os.environ, {'XDG_CURRENT_DESKTOP': 'KDE', 'DISPLAY': ':0'})
+    def test_kde_prefers_kdialog(self):
+        with patch.object(bwenv, 'IS_WINDOWS', False), patch.object(bwenv.sys, 'platform', 'linux'), \
+                patch('shutil.which', self._which('kdialog', 'zenity')):
+            command = bwenv.password_dialog_command('Master password:')
+        self.assertEqual(command, ['/usr/bin/kdialog', '--title', 'bwenv', '--password', 'Master password:'])
+
+    @patch.dict(os.environ, {'XDG_CURRENT_DESKTOP': 'GNOME', 'WAYLAND_DISPLAY': 'wayland-0'})
+    def test_other_desktops_prefer_zenity(self):
+        with patch.object(bwenv, 'IS_WINDOWS', False), patch.object(bwenv.sys, 'platform', 'linux'), \
+                patch('shutil.which', self._which('kdialog', 'zenity')):
+            command = bwenv.password_dialog_command('Master password:')
+        self.assertEqual(command[0], '/usr/bin/zenity')
+        self.assertIn('--hide-text', command)
+
+    @patch.dict(os.environ, {'XDG_CURRENT_DESKTOP': 'KDE'}, clear=True)
+    def test_no_display_means_no_dialog(self):
+        with patch.object(bwenv, 'IS_WINDOWS', False), patch.object(bwenv.sys, 'platform', 'linux'), \
+                patch('shutil.which', self._which('kdialog', 'zenity')):
+            self.assertIsNone(bwenv.password_dialog_command('Master password:'))
+
+    def test_dialog_output_keeps_spaces_but_not_the_newline(self):
+        with patch.object(bwenv, 'password_dialog_command', return_value=['dialog']), \
+                patch('subprocess.run', return_value=Mock(returncode=0, stdout='﻿ pass word \n')):
+            self.assertEqual(bwenv.ask_password_in_dialog('Master password:'), ' pass word ')
+
+    def test_cancelled_dialog_returns_none(self):
+        with patch.object(bwenv, 'password_dialog_command', return_value=['dialog']), \
+                patch('subprocess.run', return_value=Mock(returncode=1, stdout='')):
+            self.assertIsNone(bwenv.ask_password_in_dialog('Master password:'))
+
+    def test_no_dialog_tool_falls_back_to_tkinter_or_reports_none_available(self):
+        with patch.object(bwenv, 'password_dialog_command', return_value=None), \
+                patch.dict(sys.modules, {'tkinter': None}):
+            with self.assertRaises(bwenv.NoPasswordDialog):
+                bwenv.ask_password_in_dialog('Master password:')
+
+
+class TestDialogUnlock(unittest.TestCase):
+    """Unlocking a locked vault through the dialog when there is no terminal"""
+
+    PASSWORD = 'correct horse battery staple'
+
+    def setUp(self):
+        self.responses = {('bw', 'status'): '{"status":"locked"}'}
+        self.passwords_tried = []
+
+        def run(command, **kwargs):
+            if command[:3] == ['bw', 'unlock', '--passwordenv']:
+                password = kwargs['env'][command[3]]
+                self.passwords_tried.append(password)
+                if password == self.PASSWORD:
+                    return Mock(returncode=0, stdout='dialog_session_token\n', stderr='')
+                return Mock(returncode=1, stdout='', stderr='Invalid master password.')
+            return fake_bw(self.responses)(command, **kwargs)
+
+        for target, value in (('subprocess.run', Mock(side_effect=run)), ('sys.stdin', Mock())):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        sys.stdin.isatty.return_value = False
+        env_patcher = patch.dict(os.environ, {}, clear=False)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        os.environ.pop('BW_SESSION', None)
+        os.environ.pop('BWENV_PROMPT', None)
+
+    def _dialog(self, *answers):
+        patcher = patch.object(bwenv, 'ask_password_in_dialog', side_effect=list(answers))
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def test_no_terminal_unlocks_through_the_dialog(self):
+        """The password goes to bw via an environment variable, never argv or the logs"""
+        self._dialog(self.PASSWORD)
+        client = bwenv.BitwardenClient(no_sync=True)
+
+        with self.assertLogs(level='DEBUG') as logs:
+            logging.getLogger().debug("unlock test start")
+            client._run_bw_command(['list', 'items'])
+
+        unlock = [c for c in subprocess.run.call_args_list if c[0][0][:2] == ['bw', 'unlock']]
+        self.assertEqual(len(unlock), 1)
+        self.assertNotIn(self.PASSWORD, ' '.join(unlock[0][0][0]))
+        self.assertEqual(client._session, 'dialog_session_token')
+        self.assertNotIn(self.PASSWORD, '\n'.join(logs.output))
+        self.assertNotIn(bwenv.MASTER_PASSWORD_ENV, os.environ)
+
+    def test_wrong_password_asks_again(self):
+        dialog = self._dialog('wrong', self.PASSWORD)
+
+        bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertEqual(self.passwords_tried, ['wrong', self.PASSWORD])
+        self.assertIn('incorrect', dialog.call_args_list[1][0][0].lower())
+
+    def test_three_wrong_passwords_give_up(self):
+        self._dialog('a', 'b', 'c', self.PASSWORD)
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertEqual(len(self.passwords_tried), 3)
+        self.assertIn('3 attempts', str(cm.exception))
+
+    def test_other_unlock_errors_are_not_retried(self):
+        """Only a wrong password is worth asking again for; anything else is reported at once"""
+        self._dialog('anything', self.PASSWORD)
+        with patch.object(bwenv.BitwardenClient, '_exec_bw', autospec=True) as mock_exec:
+            mock_exec.side_effect = lambda self_, args, input_text=None, interactive=False, extra_env=None: (
+                Mock(returncode=0, stdout='{"status":"locked"}', stderr='') if args == ['status']
+                else Mock(returncode=1, stdout='', stderr='Failed to connect to the server.'))
+            with self.assertRaises(bwenv.BWEnvError) as cm:
+                bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertIn('Failed to connect', str(cm.exception))
+
+    def test_cancel_stops(self):
+        self._dialog(None)
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertIn('cancelled', str(cm.exception).lower())
+        self.assertEqual(self.passwords_tried, [])
+
+    def test_no_dialog_available_explains_how_to_unlock(self):
+        self._dialog(bwenv.NoPasswordDialog())
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertIn('BW_SESSION', str(cm.exception))
+
+    def test_bwenv_prompt_gui_uses_the_dialog_even_on_a_terminal(self):
+        sys.stdin.isatty.return_value = True
+        os.environ['BWENV_PROMPT'] = 'gui'
+        self._dialog(self.PASSWORD)
+
+        bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertEqual(self.passwords_tried, [self.PASSWORD])
+
+    def test_bwenv_prompt_none_never_asks(self):
+        os.environ['BWENV_PROMPT'] = 'none'
+        dialog = self._dialog(self.PASSWORD)
+
+        with self.assertRaises(bwenv.BWEnvError):
+            bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        dialog.assert_not_called()
+
+    def test_invalid_bwenv_prompt_is_an_error(self):
+        os.environ['BWENV_PROMPT'] = 'popup'
+
+        with self.assertRaises(bwenv.BWEnvError) as cm:
+            bwenv.BitwardenClient(no_sync=True)._run_bw_command(['list', 'items'])
+
+        self.assertIn('BWENV_PROMPT', str(cm.exception))
 
 
 class TestOpUriMatching(unittest.TestCase):

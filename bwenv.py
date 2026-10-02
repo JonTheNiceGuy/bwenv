@@ -19,6 +19,7 @@ Examples:
 
 Environment:
     BWENV_TIMEOUT   seconds to wait for each Bitwarden CLI call (default 120)
+    BWENV_PROMPT    how to ask for the master password: auto (default), gui, tty or none
 """
 
 import argparse
@@ -59,6 +60,10 @@ class BWEnvError(Exception):
 
 
 IS_WINDOWS = os.name == 'nt'
+PROMPT_MODES = ('auto', 'gui', 'tty', 'none')  # BWENV_PROMPT
+MASTER_PASSWORD_ENV = 'BWENV_MASTER_PASSWORD'  # only ever set in bw's own environment
+UNLOCK_ATTEMPTS = 3
+DIALOG_TIMEOUT = 300  # seconds to wait for someone to answer the password dialog
 SEND_DEFAULT_NAME = "Shared secret"
 # Bitwarden credentials bwenv may use itself but never hands to the command it runs
 BW_CREDENTIAL_VARS = ('BW_SESSION', 'BW_PASSWORD', 'BW_CLIENTID', 'BW_CLIENTSECRET')
@@ -75,6 +80,107 @@ def bw_timeout() -> float:
     if timeout <= 0:
         raise BWEnvError("BWENV_TIMEOUT must be greater than zero")
     return timeout
+
+
+class NoPasswordDialog(Exception):
+    """No desktop password dialog is available here"""
+
+
+def prompt_mode() -> str:
+    """How to ask for the master password (BWENV_PROMPT): auto, gui, tty or none"""
+    mode = os.environ.get('BWENV_PROMPT', 'auto').strip().lower()
+    if mode not in PROMPT_MODES:
+        raise BWEnvError(f"BWENV_PROMPT must be one of {', '.join(PROMPT_MODES)}, not '{mode}'")
+    return mode
+
+
+def password_dialog_command(message: str) -> Optional[List[str]]:
+    """The command that shows a masked password dialog and prints the answer, or None if there is none.
+    
+    macOS: osascript. Windows: a PowerShell WinForms box. Linux and other desktops: kdialog on KDE,
+    otherwise zenity (or kdialog), and only when there is a display to show it on.
+    """
+    if sys.platform == 'darwin':
+        osascript = shutil.which('osascript')
+        if not osascript:
+            return None
+        text = message.replace('\\', '\\\\').replace('"', '\\"')
+        return [osascript, '-e',
+                f'text returned of (display dialog "{text}" default answer "" with hidden answer '
+                f'with title "bwenv" buttons {{"Cancel", "OK"}} default button "OK" with icon caution)']
+    
+    if IS_WINDOWS:
+        powershell = shutil.which('powershell') or shutil.which('pwsh')
+        if not powershell:
+            return None
+        text = message.replace("'", "''")
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;"
+            "$f = New-Object Windows.Forms.Form; $f.Text = 'bwenv'; $f.TopMost = $true;"
+            "$f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog';"
+            "$f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.ClientSize = New-Object Drawing.Size(380, 120);"
+            f"$l = New-Object Windows.Forms.Label; $l.Text = '{text}'; $l.SetBounds(12, 12, 356, 32);"
+            "$t = New-Object Windows.Forms.TextBox; $t.UseSystemPasswordChar = $true; $t.SetBounds(12, 48, 356, 24);"
+            "$ok = New-Object Windows.Forms.Button; $ok.Text = 'OK'; $ok.DialogResult = 'OK'; $ok.SetBounds(212, 84, 75, 25);"
+            "$no = New-Object Windows.Forms.Button; $no.Text = 'Cancel'; $no.DialogResult = 'Cancel'; $no.SetBounds(293, 84, 75, 25);"
+            "$f.Controls.AddRange(@($l, $t, $ok, $no)); $f.AcceptButton = $ok; $f.CancelButton = $no;"
+            "$f.Add_Shown({ $f.Activate(); $t.Focus() });"
+            "if ($f.ShowDialog() -ne 'OK') { exit 1 };"
+            "[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false; [Console]::Out.Write($t.Text)"
+        )
+        return [powershell, '-NoProfile', '-NonInteractive', '-STA', '-Command', script]
+    
+    if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        return None
+    tools = ('kdialog', 'zenity') if 'KDE' in os.environ.get('XDG_CURRENT_DESKTOP', '').upper() else ('zenity', 'kdialog')
+    for tool in tools:
+        path = shutil.which(tool)
+        if path and tool == 'kdialog':
+            return [path, '--title', 'bwenv', '--password', message]
+        if path:
+            return [path, '--entry', '--hide-text', '--title', 'bwenv', '--text', message]
+    return None
+
+
+def _ask_password_with_tkinter(message: str) -> Optional[str]:
+    """Fallback dialog using tkinter, which some Python builds include. Raises NoPasswordDialog if unusable."""
+    try:
+        import tkinter
+        from tkinter import simpledialog
+    except ImportError:
+        raise NoPasswordDialog()
+    try:
+        root = tkinter.Tk()
+    except tkinter.TclError:  # no display
+        raise NoPasswordDialog()
+    try:
+        root.withdraw()
+        return simpledialog.askstring('bwenv', message, show='*', parent=root)
+    finally:
+        root.destroy()
+
+
+def ask_password_in_dialog(message: str) -> Optional[str]:
+    """Ask for the master password in a desktop dialog.
+    
+    Returns the password, or None if the dialog was cancelled. Raises NoPasswordDialog if no dialog
+    can be shown. The password only travels through this process's pipe from the dialog; it is
+    never logged or put on a command line.
+    """
+    command = password_dialog_command(message)
+    if command is None:
+        return _ask_password_with_tkinter(message)
+    
+    logging.debug(f"Asking for the master password with {os.path.basename(command[0])}")
+    try:
+        result = subprocess.run(command, capture_output=True, encoding='utf-8', timeout=DIALOG_TIMEOUT)
+    except FileNotFoundError:
+        raise NoPasswordDialog()
+    except subprocess.TimeoutExpired:
+        return None  # nobody answered: treat as cancelled
+    if result.returncode != 0:
+        return None
+    return (result.stdout or '').lstrip('\ufeff').rstrip('\r\n')
 
 
 def use_utf8_stdout():
@@ -189,17 +295,19 @@ class BitwardenClient:
         return env
 
     def _exec_bw(self, args: List[str], input_text: Optional[str] = None,
-                 interactive: bool = False) -> subprocess.CompletedProcess:
+                 interactive: bool = False, extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
         """Run bw and return the completed process. Only the subcommand is logged, never the arguments."""
         command = [resolve_executable('bw')] + args
         logging.debug(f"Running Bitwarden CLI command: bw {' '.join(args[:2])}")
+        env = self._bw_env()
+        env.update(extra_env or {})
         try:
             if interactive:
                 # The master password prompt needs the terminal: inherit stdin and stderr, capture the token.
-                return subprocess.run(command, stdout=subprocess.PIPE, encoding='utf-8', env=self._bw_env())
+                return subprocess.run(command, stdout=subprocess.PIPE, encoding='utf-8', env=env)
             timeout = bw_timeout()
             return subprocess.run(command, input=input_text, capture_output=True, encoding='utf-8',
-                                  env=self._bw_env(), timeout=timeout)
+                                  env=env, timeout=timeout)
         except FileNotFoundError:
             raise BWEnvError("Bitwarden CLI 'bw' not found. Please install it from bitwarden.com")
         except subprocess.TimeoutExpired:
@@ -238,11 +346,25 @@ class BitwardenClient:
         self._session_checked = True
     
     def _unlock(self):
-        """Ask for the master password on the terminal and keep the session for this client"""
-        if not sys.stdin.isatty():
-            raise BWEnvError("The Bitwarden vault is locked and there is no terminal to ask for the master "
-                             "password. Unlock it first, e.g. export BW_SESSION=\"$(bw unlock --raw)\"")
+        """Ask for the master password and keep the session for this client.
         
+        On a terminal bw asks itself; without one (an IDE, CI, a GUI launcher, piped stdin) bwenv shows a
+        desktop password dialog. BWENV_PROMPT=gui|tty|none forces a choice.
+        """
+        mode = prompt_mode()
+        if mode == 'tty' or (mode == 'auto' and sys.stdin.isatty()):
+            if sys.stdin.isatty():
+                self._unlock_on_terminal()
+                return
+        elif mode != 'none' and self._unlock_with_dialog():
+            return
+        
+        raise BWEnvError("The Bitwarden vault is locked and bwenv cannot ask for the master password here "
+                         "(no terminal or password dialog). Unlock it first, e.g. "
+                         "export BW_SESSION=\"$(bw unlock --raw)\"")
+    
+    def _unlock_on_terminal(self):
+        """Let bw ask for the master password on the terminal"""
         print("Bitwarden vault is locked. Please enter your master password to unlock:", file=sys.stderr)
         result = self._exec_bw(['unlock', '--raw'], interactive=True)
         session = (result.stdout or '').strip()
@@ -250,6 +372,34 @@ class BitwardenClient:
             raise BWEnvError(f"Failed to unlock the Bitwarden vault (bw unlock exited {result.returncode})")
         self._session = session
         logging.debug("Vault unlocked")
+    
+    def _unlock_with_dialog(self) -> bool:
+        """Unlock with a password typed into a desktop dialog. Returns False if no dialog is available."""
+        message = "Bitwarden master password (to unlock your vault for bwenv):"
+        for _ in range(UNLOCK_ATTEMPTS):
+            try:
+                password = ask_password_in_dialog(message)
+            except NoPasswordDialog:
+                return False
+            if password is None:
+                raise BWEnvError("Unlocking the Bitwarden vault was cancelled")
+            
+            # The password reaches bw in its own environment only - never argv, logs or os.environ
+            result = self._exec_bw(['unlock', '--passwordenv', MASTER_PASSWORD_ENV, '--raw', '--nointeraction'],
+                                   extra_env={MASTER_PASSWORD_ENV: password})
+            del password
+            session = (result.stdout or '').strip()
+            if result.returncode == 0 and session:
+                self._session = session
+                logging.debug("Vault unlocked")
+                return True
+            
+            stderr = result.stderr.strip() if isinstance(result.stderr, str) else ''
+            if 'invalid master password' not in stderr.lower():
+                raise BWEnvError(f"Failed to unlock the Bitwarden vault: {stderr or f'exit code {result.returncode}'}")
+            message = "Incorrect master password, please try again:"
+        
+        raise BWEnvError(f"Failed to unlock the Bitwarden vault after {UNLOCK_ATTEMPTS} attempts")
     
     def sync_vault(self):
         """Sync the Bitwarden vault"""

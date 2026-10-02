@@ -8,7 +8,7 @@ A cross-platform command-line tool that replaces environment variables containin
 - **Secure**: Uses the official Bitwarden CLI for authentication and secret retrieval
 - **Cross-Platform**: Works on Windows, macOS, and Linux
 - **URI-Based**: Simple URI style syntax for referencing secrets (see below for details)
-- **Interactive Authentication**: Automatically prompts for master password when needed
+- **Interactive Authentication**: Automatically prompts for master password when needed, in the terminal or in a desktop password box
 - **Flexible Flag Positions**: Global flags like `--debug` and `--no-sync` can be placed before or after subcommands
 - **Debug Support**: Built-in debug mode for troubleshooting that never prints secret values
 - **Secret Sharing**: `bwenv send` turns a reference into a single-use Bitwarden Send link
@@ -167,8 +167,10 @@ The tool handles Bitwarden authentication automatically:
 
 1. **First run**: You'll need to log in with `bw login`
 2. **Locked vault**: The tool will prompt for your master password, once per run
-3. **No terminal** (CI, an IDE, piped input): bwenv cannot prompt, so unlock first with
-   `export BW_SESSION="$(bw unlock --raw)"`
+3. **No terminal** (an IDE, a GUI launcher, piped input): bwenv asks in a desktop password box instead —
+   `osascript` on macOS, a PowerShell window on Windows, and `kdialog` (KDE) or `zenity` on Linux, falling back
+   to Python's `tkinter` if none of those is available. A wrong password is asked for again, up to 3 times.
+   With no desktop either (CI, SSH), unlock first with `export BW_SESSION="$(bw unlock --raw)"`
 4. **No interaction needed**: Once `BW_SESSION` is set, subsequent runs work seamlessly
 
 ## Field Types
@@ -191,6 +193,7 @@ Flags can be placed either before or after the subcommand for flexibility. For `
 Environment variables:
 
 - `BWENV_TIMEOUT`: Seconds to wait for each Bitwarden CLI call before giving up (default `120`). Without it, an unreachable server (e.g. a dropped VPN) would hang bwenv indefinitely.
+- `BWENV_PROMPT`: How to ask for the master password when the vault is locked: `auto` (default: the terminal if there is one, otherwise a desktop password box), `gui` (always the password box), `tty` (only the terminal) or `none` (never ask; fail unless `BW_SESSION` is set).
 
 ## Testing
 
@@ -209,6 +212,7 @@ The tests mock the Bitwarden CLI, so they need neither `bw` nor a vault.
   `BW_CLIENTID` and `BW_CLIENTSECRET` are removed from its environment, so it cannot read the rest of your vault
 - On Linux and macOS, `run` replaces itself with your command, so no bwenv process stays behind holding secrets
 - `send` passes the Send to the Bitwarden CLI on stdin, never on the command line where other users could see it
+- A master password typed into the desktop password box goes to `bw unlock` in that process's environment only — never on a command line, in a log, or in the environment of the command `run` starts
 - Uses official Bitwarden CLI for all vault operations
 
 ## Troubleshooting
@@ -297,3 +301,4 @@ This is a community project. For support:
 - **v1.8**: Added support for Bitwarden native URI format (`bw://`) alongside existing 1Password-compatible format (`op://`). The new format supports organization/collection paths, personal vault items, and UUID-based targeting for precise item resolution.
 - **v1.9**: Implemented the `send` subcommand to create Bitwarden Sends directly from a URI. It can send a single secret value for field-specific URIs or a JSON object of the entire item for item-only URIs, with an optional `--name flag` for custom titles.
 - **v1.10**: Security and correctness release. Secrets no longer leak: `--debug` logs value lengths, never values; `send` no longer logs its payload and passes it to `bw` on stdin instead of the command line; `run` strips `BW_SESSION` and other Bitwarden credentials from the command's environment. Sends now default to one view, hidden text, hidden email and a generic name, with new `--max-access` and `--expire-hours` options, and `op://vault/item` whole-item sends work. Lookups no longer return the wrong secret: `bw://` URIs honour the folder or collection (an unknown one is an error), `op://` matches the exact item rather than any item whose name starts the same, and a reference matching several items is an error. Fixed `op://` finding nothing with current Bitwarden CLIs, whose `--search` no longer matches website URIs. `run -- npm run build` (and `docker`/`cargo`/`kubectl run`) works, and flags after your command are left for it. `run` execs the command on Linux and macOS, so it gets Ctrl-C and SIGTERM and its exit status is bwenv's. Every `bw` call has a timeout (`BWENV_TIMEOUT`), the vault is unlocked at most once and never from piped input, output is decoded as UTF-8, and an npm-installed `bw.cmd` is found on Windows. Item, organization, folder and collection lists are fetched once per run (thanks to @lewis-lees for the item cache). Requires Python 3.7+; tests run on Linux, macOS and Windows.
+- **v1.11**: Added a desktop password box for unlocking the vault when there is no terminal (an IDE, a GUI launcher, piped input): `osascript` on macOS, PowerShell on Windows, `kdialog` or `zenity` on Linux, with a `tkinter` fallback. A wrong password is asked for again up to 3 times. `BWENV_PROMPT` (`auto`, `gui`, `tty`, `none`) chooses how bwenv asks.
