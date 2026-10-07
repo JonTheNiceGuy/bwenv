@@ -1518,5 +1518,580 @@ class TestSendCommandIntegration(unittest.TestCase):
         self.assertIn("required", result.stderr)
 
 
+class MemorySessionCache(bwenv.SessionCache):
+    """A session cache that only lives in this test"""
+    name = 'test cache'
+
+    def __init__(self, session=None, fail_store=False):
+        self.session = session
+        self.stored = []
+        self.cleared = 0
+        self.loads = 0
+        self.fail_store = fail_store
+
+    def load(self):
+        self.loads += 1
+        return self.session
+
+    def store(self, session, seconds):
+        if self.fail_store:
+            raise bwenv.BWEnvError("store is broken")
+        self.session = session
+        self.stored.append((session, seconds))
+
+    def clear(self):
+        self.session = None
+        self.cleared += 1
+
+
+class TestSessionCacheSetting(unittest.TestCase):
+    """BWENV_SESSION_CACHE: how long to keep the session"""
+
+    def _seconds(self, value):
+        with patch.dict(os.environ, {'BWENV_SESSION_CACHE': value}):
+            return bwenv.session_cache_seconds()
+
+    def test_durations(self):
+        for value, seconds in (('', 0), ('0', 0), ('3600', 3600), ('90s', 90), ('30m', 1800),
+                               ('8h', 28800), ('1.5h', 5400), ('2d', 172800), (' 8H ', 28800)):
+            self.assertEqual(self._seconds(value), seconds, value)
+
+    def test_unset_means_no_cache(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('BWENV_SESSION_CACHE', None)
+            self.assertEqual(bwenv.session_cache_seconds(), 0)
+
+    def test_nonsense_is_an_error(self):
+        for value in ('soon', '8 hours', '-1h', 'h'):
+            with self.assertRaises(bwenv.BWEnvError, msg=value):
+                self._seconds(value)
+
+
+class TestSessionCacheUse(unittest.TestCase):
+    """The client uses, refreshes and discards the cached session"""
+
+    UNLOCKED_BY = 'fresh_session'
+
+    def setUp(self):
+        self.valid_sessions = {self.UNLOCKED_BY}
+
+        def run(command, **kwargs):
+            if command == ['bw', 'status']:
+                unlocked = kwargs['env'].get('BW_SESSION') in self.valid_sessions
+                return Mock(returncode=0, stdout=json.dumps({"status": "unlocked" if unlocked else "locked"}), stderr='')
+            if command[:2] == ['bw', 'unlock']:
+                return Mock(returncode=0, stdout=self.UNLOCKED_BY + '\n', stderr='')
+            return Mock(returncode=0, stdout='[]', stderr='')
+
+        patcher = patch('subprocess.run', side_effect=run)
+        self.mock_run = patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BWENV_SESSION_CACHE': '8h', 'BWENV_PROMPT': 'gui'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        os.environ.pop('BW_SESSION', None)
+        dialog = patch.object(bwenv, 'ask_password_in_dialog', return_value='master password')
+        self.dialog = dialog.start()
+        self.addCleanup(dialog.stop)
+
+    def _list_items(self, cache):
+        client = bwenv.BitwardenClient(no_sync=True, session_cache=cache)
+        client._run_bw_command(['list', 'items'])
+        return client
+
+    def _session_given_to(self, subcommand):
+        return [c[1]['env'].get('BW_SESSION') for c in self.mock_run.call_args_list if c[0][0][1] == subcommand]
+
+    def test_an_unlock_is_cached_with_its_lifetime(self):
+        cache = MemorySessionCache()
+        self._list_items(cache)
+        self.assertEqual(cache.stored, [(self.UNLOCKED_BY, 28800)])
+        self.dialog.assert_called_once()
+
+    def test_a_cached_session_saves_the_password_prompt(self):
+        self.valid_sessions.add('cached_session')
+        cache = MemorySessionCache('cached_session')
+        client = self._list_items(cache)
+        self.dialog.assert_not_called()
+        self.assertEqual(client._session, 'cached_session')
+        self.assertEqual(self._session_given_to('list'), ['cached_session'])
+        self.assertEqual(cache.stored, [])
+        self.assertNotIn('BW_SESSION', os.environ)
+
+    def test_a_cached_session_that_no_longer_unlocks_is_discarded(self):
+        cache = MemorySessionCache('stale_session')
+        client = self._list_items(cache)
+        self.assertEqual(cache.cleared, 1)
+        self.dialog.assert_called_once()
+        self.assertEqual(client._session, self.UNLOCKED_BY)
+        self.assertEqual(cache.stored, [(self.UNLOCKED_BY, 28800)])
+
+    def test_an_inherited_session_wins(self):
+        self.valid_sessions.add('inherited')
+        cache = MemorySessionCache('cached_session')
+        with patch.dict(os.environ, {'BW_SESSION': 'inherited'}):
+            self._list_items(cache)
+        self.assertEqual(cache.loads, 0)
+        self.assertEqual(self._session_given_to('list'), ['inherited'])
+
+    def test_no_setting_means_no_cache(self):
+        os.environ.pop('BWENV_SESSION_CACHE')
+        self.valid_sessions.add('cached_session')
+        cache = MemorySessionCache('cached_session')
+        self._list_items(cache)
+        self.assertEqual((cache.loads, cache.stored), (0, []))
+        self.dialog.assert_called_once()
+
+    def test_a_cache_that_cannot_store_only_warns(self):
+        cache = MemorySessionCache(fail_store=True)
+        with patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            client = self._list_items(cache)
+        self.assertIn('could not cache', stderr.getvalue())
+        self.assertNotIn(self.UNLOCKED_BY, stderr.getvalue())
+        self.assertEqual(client._session, self.UNLOCKED_BY)
+
+    def test_no_session_store_warns_and_carries_on(self):
+        with patch.object(bwenv, 'default_session_cache', return_value=None), \
+                patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            self._list_items(None)
+        self.assertIn('BWENV_SESSION_CACHE is set', stderr.getvalue())
+
+    def test_run_still_strips_the_cached_session_from_the_child(self):
+        self.valid_sessions.add('cached_session')
+        client = bwenv.BitwardenClient(no_sync=True, session_cache=MemorySessionCache('cached_session'))
+        with patch.dict(os.environ, {'APP_SECRET': 'op://Vault/item/field'}):
+            with patch.object(client, 'find_item_by_uri_prefix', side_effect=lambda *a: (
+                    client._ensure_unlocked(), {"fields": [{"name": "field", "value": "v"}]})[1]):
+                env = bwenv.EnvironmentProcessor(client).create_resolved_environment()
+        self.assertEqual(client._session, 'cached_session')
+        self.assertNotIn('BW_SESSION', env)
+        self.assertNotIn('cached_session', env.values())
+
+    def test_lock_forgets_the_cached_session(self):
+        cache = MemorySessionCache('cached_session')
+        with patch.object(bwenv, 'default_session_cache', return_value=cache), patch('builtins.print'):
+            bwenv.lock_session(argparse.Namespace())
+        self.assertIsNone(cache.session)
+
+
+def keyctl_works():
+    keyctl = bwenv.shutil.which('keyctl')
+    if not keyctl:
+        return False
+    return subprocess.run([keyctl, 'show', '@u'], capture_output=True).returncode == 0
+
+
+class TestKeyctlSessionCache(unittest.TestCase):
+    """Linux kernel keyring store"""
+
+    def test_session_goes_on_stdin_with_permissions_and_timeout(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs.get('input')))
+            if command[1] == 'padd':
+                return Mock(returncode=0, stdout='123\n', stderr='')
+            if command[1] == 'search':
+                return Mock(returncode=1, stdout='', stderr='not found')
+            return Mock(returncode=0, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=run):
+            bwenv.KeyctlSessionCache('keyctl').store('the_session', 600)
+
+        padd = [c for c in calls if c[0][1] == 'padd']
+        self.assertEqual(padd, [(['keyctl', 'padd', 'user', 'bwenv_session', '@u'], 'the_session')])
+        self.assertTrue(all('the_session' not in ' '.join(c[0]) for c in calls))
+        self.assertIn((['keyctl', 'setperm', '123', '0x3f3f0000'], None), calls)
+        self.assertIn((['keyctl', 'timeout', '123', '600'], None), calls)
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and keyctl_works(), 'needs a usable keyctl')
+    def test_real_keyring_round_trip_and_expiry(self):
+        cache = bwenv.KeyctlSessionCache(bwenv.shutil.which('keyctl'), description='bwenv_unittest')
+        self.addCleanup(cache.clear)
+        cache.store('dummy+session/value==', 1)
+        self.assertEqual(cache.load(), 'dummy+session/value==')
+        bwenv.time.sleep(2)
+        self.assertIsNone(cache.load())
+        cache.store('another', 60)
+        cache.clear()
+        self.assertIsNone(cache.load())
+
+
+class TestKeychainSessionCache(unittest.TestCase):
+    """macOS keychain store"""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(bwenv.shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, 'bwenv-test.keychain-db')
+
+    def test_session_and_keychain_password_go_to_security_on_stdin(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs.get('input')))
+            if command[1] == '-i':
+                open(self.path, 'w').close()
+            if command[1] == 'find-generic-password':
+                return Mock(returncode=0, stdout='the_session\n', stderr='')
+            return Mock(returncode=0, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=run):
+            cache = bwenv.KeychainSessionCache('security', self.path)
+            cache.store('the_session', 600)
+            self.assertEqual(cache.load(), 'the_session')
+
+        script = [c[1] for c in calls if c[0] == ['security', '-i']][0]
+        self.assertIn('-w the_session', script)
+        self.assertIn('-t 600', script)
+        self.assertTrue(all('the_session' not in ' '.join(c[0]) for c in calls))
+
+    def test_an_expired_keychain_is_deleted_without_reading_it(self):
+        open(self.path, 'w').close()
+        with open(self.path + '.expires', 'w') as f:
+            f.write('1\n')
+        with patch('subprocess.run', return_value=Mock(returncode=0, stdout='', stderr='')) as run:
+            self.assertIsNone(bwenv.KeychainSessionCache('security', self.path).load())
+        self.assertEqual([c[0][0][1] for c in run.call_args_list], ['delete-keychain'])
+        self.assertFalse(os.path.exists(self.path + '.expires'))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'needs macOS')
+    def test_real_keychain_round_trip(self):
+        cache = bwenv.KeychainSessionCache(bwenv.shutil.which('security'), self.path)
+        self.addCleanup(cache.clear)
+        cache.store('dummy+session/value==', 60)
+        self.assertEqual(cache.load(), 'dummy+session/value==')
+        cache.clear()
+        self.assertIsNone(cache.load())
+        self.assertFalse(os.path.exists(self.path))
+
+
+class TestDpapiSessionCache(unittest.TestCase):
+    """Windows DPAPI file store"""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(bwenv.shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, 'bwenv', 'session.bin')
+
+    def _fake_dpapi(self):
+        """Reversible stand-in for DPAPI, so the expiry logic is tested on every platform"""
+        patchers = [patch.object(bwenv, 'dpapi_protect', side_effect=lambda data, entropy: data[::-1]),
+                    patch.object(bwenv, 'dpapi_unprotect', side_effect=lambda data, entropy: data[::-1])]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_round_trip_and_expiry(self):
+        self._fake_dpapi()
+        cache = bwenv.DpapiSessionCache(self.path)
+        cache.store('the_session', 60)
+        self.assertEqual(cache.load(), 'the_session')
+        with patch.object(bwenv.time, 'time', return_value=bwenv.time.time() + 61):
+            self.assertIsNone(cache.load())
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_an_unreadable_file_is_discarded(self):
+        self._fake_dpapi()
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, 'wb') as f:
+            f.write(b'garbage')
+        self.assertIsNone(bwenv.DpapiSessionCache(self.path).load())
+        self.assertFalse(os.path.exists(self.path))
+
+    @unittest.skipUnless(bwenv.IS_WINDOWS, 'needs Windows')
+    def test_real_dpapi_round_trip(self):
+        cache = bwenv.DpapiSessionCache(self.path)
+        cache.store('dummy+session/value==', 60)
+        with open(self.path, 'rb') as f:
+            self.assertNotIn(b'dummy+session', f.read())
+        self.assertEqual(cache.load(), 'dummy+session/value==')
+        cache.clear()
+        self.assertIsNone(cache.load())
+
+
+class FakeVault:
+    """A bw CLI with a vault that create/edit really change"""
+
+    def __init__(self, items, folders=(), collections=(), organizations=()):
+        self.items = [json.loads(json.dumps(i)) for i in items]
+        self.folders = list(folders)
+        self.collections = list(collections)
+        self.organizations = list(organizations)
+        self.calls = []
+        self.next_id = 1
+
+    def _new_id(self, prefix):
+        self.next_id += 1
+        return f"{prefix}-{self.next_id}"
+
+    def __call__(self, command, **kwargs):
+        self.calls.append((list(command), kwargs.get('input')))
+        args = list(command[1:])
+        payload = json.loads(base64.b64decode(kwargs['input'])) if kwargs.get('input') else None
+        if args == ['status']:
+            out = {"status": "unlocked"}
+        elif args[0] == 'list':
+            out = {'items': self.items, 'folders': self.folders, 'collections': self.collections,
+                   'organizations': self.organizations}[args[1]]
+        elif args[:2] == ['get', 'item']:
+            out = next(i for i in self.items if i['id'] == args[2])
+        elif args == ['create', 'folder']:
+            out = dict(payload, id=self._new_id('folder'))
+            self.folders.append(out)
+        elif args == ['create', 'item']:
+            out = dict(payload, id=self._new_id('item'))
+            self.items.append(out)
+        elif args[:2] == ['edit', 'item']:
+            out = payload
+            self.items = [payload if i['id'] == args[2] else i for i in self.items]
+        else:
+            out = ''
+        return Mock(returncode=0, stdout=json.dumps(out) if out != '' else '', stderr='')
+
+    def writes(self):
+        return [c for c in self.calls if c[0][1] in ('create', 'edit')]
+
+    def item(self, name):
+        return next(i for i in self.items if i['name'] == name)
+
+
+class TestSetCommand(unittest.TestCase):
+    """`bwenv set`: store values typed into a masked prompt"""
+
+    SECRET = 'n3w-S3cret-Do-Not-Log'
+    ORG = '7e6ff908-4315-4377-9834-7154889cb4c8'
+    ITEMS = [
+        {"id": "demo", "name": "DEMO_DATA", "organizationId": None, "folderId": "f-demo", "type": 1,
+         "login": {"username": "u", "password": "p"},
+         "fields": [{"name": "prod/plaintext", "value": "old", "type": 0}, {"name": "keep", "value": "k", "type": 1}]},
+        {"id": "twin1", "name": "twin", "organizationId": None, "folderId": "f-demo", "type": 2, "fields": []},
+        {"id": "twin2", "name": "twin", "organizationId": None, "folderId": "f-demo", "type": 2, "fields": []},
+        {"id": "outer", "name": "Work", "organizationId": None, "folderId": None, "type": 2, "fields": []},
+        {"id": "inner", "name": "app", "organizationId": None, "folderId": "f-work", "type": 2, "fields": []},
+    ]
+    FOLDERS = [{"id": "f-demo", "name": "Demo/Data"}, {"id": "f-work", "name": "Work"}]
+    COLLECTIONS = [{"id": "c-1", "name": "Team", "organizationId": ORG}]
+
+    def setUp(self):
+        self.vault = FakeVault(self.ITEMS, self.FOLDERS, self.COLLECTIONS)
+        patcher = patch('subprocess.run', side_effect=self.vault)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        ask = patch.object(bwenv, 'ask_secret_value', return_value=self.SECRET)
+        self.ask = ask.start()
+        self.addCleanup(ask.stop)
+
+    def _set(self, *uris):
+        args = argparse.Namespace(uri=list(uris), no_sync=True)
+        with patch('sys.stderr', new_callable=io.StringIO) as stderr, self.assertLogs(level='DEBUG') as logs:
+            logging.getLogger().debug("set test start")
+            try:
+                bwenv.set_secrets(args)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        output = stderr.getvalue() + '\n'.join(logs.output)
+        self.assertNotIn(self.SECRET, output)
+        for command, _ in self.vault.calls:
+            self.assertNotIn(self.SECRET, ' '.join(command), "values must not be on the command line")
+        return code, stderr.getvalue()
+
+    def test_adds_a_hidden_field_and_keeps_the_others(self):
+        code, _ = self._set('bw://myvault/Demo/Data/DEMO_DATA/API_TOKEN')
+        self.assertEqual(code, 0)
+        item = self.vault.item('DEMO_DATA')
+        self.assertIn({"name": "API_TOKEN", "value": self.SECRET, "type": 1, "linkedId": None}, item['fields'])
+        self.assertIn({"name": "keep", "value": "k", "type": 1}, item['fields'])
+        self.assertEqual(item['login'], {"username": "u", "password": "p"})
+        self.assertEqual([c[0] for c in self.vault.writes()], [['bw', 'edit', 'item', 'demo']])
+
+    def test_replaces_an_existing_field_with_a_slash_in_its_name(self):
+        code, _ = self._set('bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext')
+        self.assertEqual(code, 0)
+        fields = self.vault.item('DEMO_DATA')['fields']
+        self.assertIn({"name": "prod/plaintext", "value": self.SECRET, "type": 0}, fields)
+        self.assertIn('(replace)', self.ask.call_args[0][0])
+
+    def test_sets_the_login_password(self):
+        self._set('bw://myvault/Demo/Data/DEMO_DATA/password')
+        self.assertEqual(self.vault.item('DEMO_DATA')['login']['password'], self.SECRET)
+
+    def test_creates_the_folder_and_a_secure_note(self):
+        code, _ = self._set('bw://myvault/New/Place/svc/TOKEN')
+        self.assertEqual(code, 0)
+        folder = next(f for f in self.vault.folders if f['name'] == 'New/Place')
+        item = self.vault.item('svc')
+        self.assertEqual((item['type'], item['folderId'], item['organizationId']), (2, folder['id'], None))
+        self.assertEqual(item['fields'], [{"name": "TOKEN", "value": self.SECRET, "type": 1, "linkedId": None}])
+        self.assertEqual([c[0] for c in self.vault.writes()],
+                         [['bw', 'create', 'folder'], ['bw', 'create', 'item']])
+
+    def test_several_fields_of_a_new_item_make_one_item(self):
+        self._set('bw://myvault/Demo/Data/svc/A', 'bw://myvault/Demo/Data/svc/B')
+        self.assertEqual([c[0] for c in self.vault.writes()], [['bw', 'create', 'item']])
+        self.assertEqual([f['name'] for f in self.vault.item('svc')['fields']], ['A', 'B'])
+
+    def test_creates_an_organization_item_in_its_collection(self):
+        self.vault.organizations = [{"id": self.ORG, "name": "DICE.fm"}]
+        self._set('bw://DICE.fm/Team/svc/TOKEN')
+        item = self.vault.item('svc')
+        self.assertEqual((item['organizationId'], item['collectionIds'], item['folderId']), (self.ORG, ['c-1'], None))
+
+    def test_refuses_a_missing_collection(self):
+        code, stderr = self._set(f'bw://{self.ORG}/Nowhere/svc/TOKEN')
+        self.assertEqual(code, 1)
+        self.assertIn("does not create collections", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
+    def test_refuses_an_ambiguous_item_before_asking(self):
+        code, stderr = self._set('bw://myvault/Demo/Data/twin/TOKEN')
+        self.assertEqual(code, 1)
+        self.assertIn("2 items named 'twin'", stderr)
+        self.ask.assert_not_called()
+        self.assertEqual(self.vault.writes(), [])
+
+    def test_refuses_a_uri_that_fits_two_items(self):
+        """bw://myvault/Work/app/TOKEN could be field app/TOKEN of item Work, or TOKEN of app in folder Work"""
+        code, stderr = self._set('bw://myvault/Work/app/TOKEN')
+        self.assertEqual(code, 1)
+        self.assertIn("more than one item", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
+    def test_refuses_to_guess_between_an_existing_item_and_a_new_one(self):
+        """With item Work at the top level, bw://myvault/Work/svc/A could be its field svc/A or a new item svc"""
+        code, stderr = self._set('bw://myvault/Work/svc/A')
+        self.assertEqual(code, 1)
+        self.assertIn("field 'svc/A' of 'Work'", stderr)
+        self.assertIn("a new item 'svc' in 'Work'", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
+    def test_a_folder_id_settles_it(self):
+        code, _ = self._set('bw://myvault/f-work/svc/A')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.vault.item('svc')['folderId'], 'f-work')
+
+    def test_refuses_op_uris(self):
+        code, stderr = self._set('op://Personal/demo/field')
+        self.assertEqual(code, 1)
+        self.assertIn("bw:// URIs", stderr)
+
+    def test_a_later_read_in_the_same_run_sees_the_new_value(self):
+        client = bwenv.BitwardenClient(no_sync=True)
+        target = client.plan_field_write('bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext')
+        client.write_fields(target, {target.field: 'fresh'})
+        self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext'), 'fresh')
+        new = client.plan_field_write('bw://myvault/Other/svc/TOKEN')
+        client.write_fields(new, {'TOKEN': 'brand new'})
+        self.assertEqual(client.resolve_bw_uri_to_value('bw://myvault/Other/svc/TOKEN'), 'brand new')
+
+
+class TestAskSecretValue(unittest.TestCase):
+    """The masked prompt for a value to store"""
+
+    def _ask(self, prompt, tty, **patches):
+        with patch.dict(os.environ, {'BWENV_PROMPT': prompt}), patch('sys.stdin') as stdin:
+            stdin.isatty.return_value = tty
+            return bwenv.ask_secret_value('Value for X:')
+
+    def test_terminal_uses_getpass(self):
+        with patch('getpass.getpass', return_value='typed') as getpass_mock:
+            self.assertEqual(self._ask('auto', True), 'typed')
+        getpass_mock.assert_called_once()
+
+    def test_no_terminal_uses_the_dialog(self):
+        with patch.object(bwenv, 'ask_password_in_dialog', return_value='boxed'):
+            self.assertEqual(self._ask('auto', False), 'boxed')
+
+    def test_cancel_empty_and_none_store_nothing(self):
+        with patch.object(bwenv, 'ask_password_in_dialog', return_value=None):
+            self.assertRaisesRegex(bwenv.BWEnvError, 'Cancelled', self._ask, 'gui', False)
+        with patch.object(bwenv, 'ask_password_in_dialog', return_value=''):
+            self.assertRaisesRegex(bwenv.BWEnvError, 'empty', self._ask, 'gui', False)
+        self.assertRaisesRegex(bwenv.BWEnvError, 'BWENV_PROMPT=none', self._ask, 'none', True)
+        with patch.object(bwenv, 'ask_password_in_dialog', side_effect=bwenv.NoPasswordDialog()):
+            self.assertRaisesRegex(bwenv.BWEnvError, 'cannot ask', self._ask, 'auto', False)
+
+
+class TestEnvFileParsing(unittest.TestCase):
+    """KEY=VALUE files for `bwenv import`"""
+
+    def test_dotenv_syntax(self):
+        text = '\n'.join([
+            '# a comment', '', 'PLAIN=value', 'export EXPORTED=yes', '  SPACED = padded  ',
+            'COMMENTED=abc # trailing', 'HASH=a#b', "SINGLE='lit $HOME \\n'", 'DOUBLE="a \\"q\\" \\n\\\\"',
+            'EMPTY=', 'QUOTED_COMMENT="x" # note', 'PLAIN=last wins',
+        ])
+        self.assertEqual(bwenv.parse_env_file(text), {
+            'PLAIN': 'last wins', 'EXPORTED': 'yes', 'SPACED': 'padded', 'COMMENTED': 'abc', 'HASH': 'a#b',
+            'SINGLE': 'lit $HOME \\n', 'DOUBLE': 'a "q" \n\\', 'EMPTY': '', 'QUOTED_COMMENT': 'x',
+        })
+
+    def test_errors_name_the_line_but_never_the_value(self):
+        for text, message in (('GOOD=1\nnot a pair s3cret', 'Line 2'), ('KEY="s3cret', 'unterminated'),
+                              ("KEY='a' s3cret", 'after its closing quote')):
+            with self.assertRaises(bwenv.BWEnvError) as raised:
+                bwenv.parse_env_file(text)
+            self.assertIn(message, str(raised.exception))
+            self.assertNotIn('s3cret', str(raised.exception))
+
+
+class TestImportCommand(unittest.TestCase):
+    """`bwenv import`: move a .env file into an item"""
+
+    def setUp(self):
+        import tempfile
+        self.vault = FakeVault(TestSetCommand.ITEMS, TestSetCommand.FOLDERS)
+        patcher = patch('subprocess.run', side_effect=self.vault)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        handle, self.env_file = tempfile.mkstemp(suffix='.env')
+        os.close(handle)
+        self.addCleanup(os.remove, self.env_file)
+        with open(self.env_file, 'w') as f:
+            f.write('# app\nDB_PASSWORD="pa ss"\nexport API_KEY=k-123\n')
+
+    def _import(self, uri):
+        with patch('sys.stdout', new_callable=io.StringIO) as stdout, \
+                patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            try:
+                bwenv.import_env_file(argparse.Namespace(uri=uri, file=self.env_file, no_sync=True))
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_creates_the_item_and_prints_references(self):
+        code, stdout, _ = self._import('bw://myvault/Work/myapp')
+        self.assertEqual(code, 0)
+        item = self.vault.item('myapp')
+        self.assertEqual({f['name']: (f['value'], f['type']) for f in item['fields']},
+                         {'DB_PASSWORD': ('pa ss', 1), 'API_KEY': ('k-123', 1)})
+        self.assertEqual(stdout, 'DB_PASSWORD=bw://myvault/Work/myapp/DB_PASSWORD\n'
+                                 'API_KEY=bw://myvault/Work/myapp/API_KEY\n')
+        for command, _ in self.vault.calls:
+            self.assertNotIn('k-123', ' '.join(command))
+
+    def test_updates_an_existing_item(self):
+        code, _, _ = self._import('bw://myvault/Demo/Data/DEMO_DATA')
+        self.assertEqual(code, 0)
+        names = [f['name'] for f in self.vault.item('DEMO_DATA')['fields']]
+        self.assertEqual(names, ['prod/plaintext', 'keep', 'DB_PASSWORD', 'API_KEY'])
+
+    def test_refuses_an_ambiguous_item(self):
+        code, _, stderr = self._import('bw://myvault/Demo/Data/twin')
+        self.assertEqual(code, 1)
+        self.assertIn("2 items named 'twin'", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
+
 if __name__ == '__main__':
     unittest.main()

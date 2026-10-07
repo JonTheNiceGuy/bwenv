@@ -9,6 +9,9 @@ Usage:
     bwenv run [--no-sync] [--debug] <command> [args...]
     bwenv read [--no-sync] [--debug] <uri>
     bwenv send [--no-sync] [--debug] [--name <title>] [--max-access N] [--expire-hours H] <uri>...
+    bwenv set [--no-sync] [--debug] <bw-uri>...
+    bwenv import [--no-sync] [--debug] <bw-item-uri> <file>
+    bwenv lock
 
 Examples:
     bwenv run sh
@@ -16,22 +19,28 @@ Examples:
     bwenv run --no-sync python app.py
     bwenv run -- npm run build
     bwenv send --max-access 3 op://Employee/example/secret
+    bwenv set bw://myvault/Work/github/GITHUB_TOKEN
+    bwenv import bw://myvault/Work/myapp .env > .env.bwenv
 
 Environment:
-    BWENV_TIMEOUT   seconds to wait for each Bitwarden CLI call (default 120)
-    BWENV_PROMPT    how to ask for the master password: auto (default), gui, tty or none
+    BWENV_TIMEOUT        seconds to wait for each Bitwarden CLI call (default 120)
+    BWENV_PROMPT         how to ask for passwords and values: auto (default), gui, tty or none
+    BWENV_SESSION_CACHE  keep an unlocked session this long (e.g. 8h); unset or 0: do not keep it
 """
 
 import argparse
 import base64
 import datetime
+import getpass
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 if sys.version_info < (3, 7):
@@ -171,7 +180,7 @@ def ask_password_in_dialog(message: str) -> Optional[str]:
     if command is None:
         return _ask_password_with_tkinter(message)
     
-    logging.debug(f"Asking for the master password with {os.path.basename(command[0])}")
+    logging.debug(f"Asking for a password with {os.path.basename(command[0])}")
     try:
         result = subprocess.run(command, capture_output=True, encoding='utf-8', timeout=DIALOG_TIMEOUT)
     except FileNotFoundError:
@@ -201,6 +210,271 @@ def resolve_executable(name: str) -> str:
     if IS_WINDOWS:
         return shutil.which(name) or name
     return name
+
+
+def ask_secret_value(message: str) -> str:
+    """Ask for a secret to store, masked: on the terminal if there is one, otherwise in the password dialog.
+
+    Follows BWENV_PROMPT like the master password prompt. The value is never echoed, logged or put on
+    a command line. Raises BWEnvError if nobody can be asked, the prompt is cancelled or the value is empty.
+    """
+    mode = prompt_mode()
+    if mode == 'tty' or (mode == 'auto' and sys.stdin.isatty()):
+        if not sys.stdin.isatty():
+            raise BWEnvError("BWENV_PROMPT=tty but there is no terminal to ask for the value on")
+        try:
+            value = getpass.getpass(message + ' ')
+        except (EOFError, KeyboardInterrupt):
+            value = None
+    elif mode == 'none':
+        raise BWEnvError("BWENV_PROMPT=none, so bwenv cannot ask for the value to store")
+    else:
+        try:
+            value = ask_password_in_dialog(message)
+        except NoPasswordDialog:
+            raise BWEnvError("bwenv cannot ask for the value here (no terminal or password dialog)")
+    if value is None:
+        raise BWEnvError("Cancelled; nothing was stored")
+    if not value:
+        raise BWEnvError("The value was empty; nothing was stored")
+    return value
+
+
+SESSION_CACHE_ENV = 'BWENV_SESSION_CACHE'
+DURATION_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+
+
+def session_cache_seconds() -> int:
+    """How long to keep an unlocked session (BWENV_SESSION_CACHE, e.g. 8h, 30m, 3600); 0 means no cache"""
+    value = os.environ.get(SESSION_CACHE_ENV, '').strip().lower()
+    if not value:
+        return 0
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([smhd]?)', value)
+    if not match:
+        raise BWEnvError(f"{SESSION_CACHE_ENV} must be a duration such as 8h, 30m or 3600 (seconds), not '{value}'")
+    return int(float(match.group(1)) * DURATION_UNITS[match.group(2) or 's'])
+
+
+class SessionCache:
+    """Somewhere to keep an unlocked vault session between runs, until it expires.
+
+    The session is passed to the store on stdin or in memory, never on a command line or in a log.
+    """
+    name = 'session cache'
+
+    def load(self) -> Optional[str]:
+        """The cached session, or None if there is none or it has expired"""
+        raise NotImplementedError
+
+    def store(self, session: str, seconds: int):
+        """Keep the session for this many seconds, replacing any cached one"""
+        raise NotImplementedError
+
+    def clear(self):
+        """Forget the cached session now"""
+        raise NotImplementedError
+
+    @staticmethod
+    def _run(command: List[str], input_text: Optional[str] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(command, input=input_text, capture_output=True, encoding='utf-8', timeout=30)
+
+
+class KeyctlSessionCache(SessionCache):
+    """Linux: the kernel user keyring, held in memory, with an expiry the kernel enforces"""
+    name = 'kernel keyring (keyctl)'
+
+    def __init__(self, keyctl: str, description: str = 'bwenv_session'):
+        self.keyctl = keyctl
+        self.description = description
+
+    def _key_id(self) -> Optional[str]:
+        result = self._run([self.keyctl, 'search', '@u', 'user', self.description])
+        return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+    def load(self) -> Optional[str]:
+        key_id = self._key_id()  # an expired key is not found
+        if not key_id:
+            return None
+        result = self._run([self.keyctl, 'pipe', key_id])
+        return result.stdout if result.returncode == 0 and result.stdout else None
+
+    def store(self, session: str, seconds: int):
+        self.clear()
+        result = self._run([self.keyctl, 'padd', 'user', self.description, '@u'], input_text=session)
+        key_id = result.stdout.strip()
+        if result.returncode != 0 or not key_id:
+            raise BWEnvError(f"keyctl padd failed: {result.stderr.strip() or f'exit code {result.returncode}'}")
+        # Readable by the user's other processes (not only this one, the "possessor"), and nobody else's
+        for args in (['setperm', key_id, '0x3f3f0000'], ['timeout', key_id, str(seconds)]):
+            if self._run([self.keyctl] + args).returncode != 0:
+                self.clear()
+                raise BWEnvError(f"keyctl {args[0]} failed")
+
+    def clear(self):
+        for _ in range(10):  # normally one key; stop rather than loop forever on an odd keyring
+            key_id = self._key_id()
+            if not key_id or self._run([self.keyctl, 'unlink', key_id, '@u']).returncode != 0:
+                return
+
+
+class KeychainSessionCache(SessionCache):
+    """macOS: a keychain of bwenv's own, with a throwaway password, that locks itself after the expiry.
+
+    Nothing ever unlocks it again: once it has locked, or a small file beside it says the time is up,
+    the keychain is deleted and the next unlock makes a new one.
+    """
+    name = 'bwenv keychain'
+    SERVICE = 'bwenv'
+    ACCOUNT = 'bw-session'
+
+    def __init__(self, security: str, keychain: Optional[str] = None):
+        self.security = security
+        self.keychain = keychain or os.path.expanduser('~/Library/Keychains/bwenv.keychain-db')
+        self.expiry_file = self.keychain + '.expires'
+
+    def _expires(self) -> float:
+        try:
+            with open(self.expiry_file, encoding='utf-8') as f:
+                return float(f.read().strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def load(self) -> Optional[str]:
+        if not os.path.exists(self.keychain):
+            return None
+        if time.time() >= self._expires():
+            self.clear()  # never read an expired keychain: it may be locked, and reading would ask to unlock it
+            return None
+        result = self._run([self.security, 'find-generic-password', '-s', self.SERVICE, '-a', self.ACCOUNT,
+                            '-w', self.keychain])
+        session = result.stdout.strip()
+        return session if result.returncode == 0 and session else None
+
+    def store(self, session: str, seconds: int):
+        self.clear()
+        if '"' in self.keychain or not re.fullmatch(r'[A-Za-z0-9+/=._-]+', session):
+            raise BWEnvError("cannot pass this session or keychain path to `security -i` safely")
+        # `security -i` reads the commands on stdin, so neither the session nor the keychain password is on argv
+        commands = (
+            f'create-keychain -p {secrets.token_hex(32)} "{self.keychain}"\n'
+            f'set-keychain-settings -u -t {seconds} "{self.keychain}"\n'
+            f'add-generic-password -U -s {self.SERVICE} -a {self.ACCOUNT} -w {session} "{self.keychain}"\n'
+        )
+        result = self._run([self.security, '-i'], input_text=commands)
+        if result.returncode != 0 or self.load_unchecked() != session:
+            self.clear()
+            raise BWEnvError("could not store the session in a keychain")
+        with open(self.expiry_file, 'w', encoding='utf-8') as f:
+            f.write(f"{time.time() + seconds:.0f}\n")
+
+    def load_unchecked(self) -> Optional[str]:
+        result = self._run([self.security, 'find-generic-password', '-s', self.SERVICE, '-a', self.ACCOUNT,
+                            '-w', self.keychain])
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def clear(self):
+        if os.path.exists(self.keychain):
+            self._run([self.security, 'delete-keychain', self.keychain])
+        for path in (self.keychain, self.expiry_file):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+class DpapiSessionCache(SessionCache):
+    """Windows: a file encrypted to the user's account with DPAPI, carrying its own expiry time.
+
+    Unlike a session credential in Credential Manager, this works for every logon type (including
+    SSH and WinRM), and bwenv enforces the expiry when it reads the file.
+    """
+    name = 'DPAPI-encrypted file'
+    ENTROPY = b'bwenv-session'
+
+    def __init__(self, path: Optional[str] = None):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        self.path = path or os.path.join(base, 'bwenv', 'session.bin')
+
+    def load(self) -> Optional[str]:
+        try:
+            with open(self.path, 'rb') as f:
+                data = f.read()
+        except FileNotFoundError:
+            return None
+        session = ''
+        try:
+            expires, _, session =dpapi_unprotect(data, self.ENTROPY).decode('utf-8').partition('\n')
+            expired = time.time() >= float(expires)
+        except (OSError, ValueError, UnicodeDecodeError):
+            expired = True  # unreadable: treat as expired
+        if expired or not session:
+            self.clear()
+            return None
+        return session
+
+    def store(self, session: str, seconds: int):
+        data = dpapi_protect(f"{time.time() + seconds:.0f}\n{session}".encode('utf-8'), self.ENTROPY)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        temp = self.path + '.tmp'
+        with open(temp, 'wb') as f:
+            f.write(data)
+        os.replace(temp, self.path)
+
+    def clear(self):
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+
+
+def _dpapi(data: bytes, entropy: bytes, protect: bool) -> bytes:
+    """CryptProtectData / CryptUnprotectData for the current user, without any UI"""
+    import ctypes
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+    def blob(raw: bytes) -> DataBlob:
+        buffer = ctypes.create_string_buffer(raw, len(raw))
+        return DataBlob(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    function = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    function.argtypes = [ctypes.POINTER(DataBlob), wintypes.LPCWSTR, ctypes.POINTER(DataBlob), ctypes.c_void_p,
+                         ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob)]
+    function.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    data_in, entropy_in, data_out = blob(data), blob(entropy), DataBlob()
+    CRYPTPROTECT_UI_FORBIDDEN = 0x1
+    if not function(ctypes.byref(data_in), 'bwenv' if protect else None, ctypes.byref(entropy_in), None, None,
+                    CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(data_out)):
+        raise OSError(f"DPAPI failed (error {ctypes.GetLastError()})")
+    try:
+        return ctypes.string_at(data_out.pbData, data_out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(data_out.pbData, ctypes.c_void_p))
+
+
+def dpapi_protect(data: bytes, entropy: bytes) -> bytes:
+    return _dpapi(data, entropy, protect=True)
+
+
+def dpapi_unprotect(data: bytes, entropy: bytes) -> bytes:
+    return _dpapi(data, entropy, protect=False)
+
+
+def default_session_cache() -> Optional[SessionCache]:
+    """This platform's session store, or None if it has none (Linux needs keyctl, from keyutils)"""
+    if IS_WINDOWS:
+        return DpapiSessionCache()
+    if sys.platform == 'darwin':
+        security = shutil.which('security')
+        return KeychainSessionCache(security) if security else None
+    keyctl = shutil.which('keyctl')
+    return KeyctlSessionCache(keyctl) if keyctl else None
 
 
 class URIParser:
@@ -271,16 +545,78 @@ class URIParser:
         return cls.is_op_uri(value) or cls.is_bw_uri(value)
 
 
+class WriteTarget:
+    """Where `set` or `import` stores a value: an existing item, or the item to create"""
+
+    def __init__(self, org_id: Optional[str], path: str, item_name: str, field: str, item: Optional[Dict]):
+        self.org_id = org_id
+        self.path = path  # folder (personal vault) or collection (organization); '' for none
+        self.item_name = item_name
+        self.field = field
+        self.item = item  # None until the item exists
+
+    @property
+    def key(self) -> tuple:
+        """The same for every target in one item, so writes to it can be grouped"""
+        return ('id', self.item['id']) if self.item else ('new', self.org_id, self.path, self.item_name)
+
+
+ENV_LINE_PATTERN = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$')
+DOUBLE_QUOTE_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '"': '"', '\\': '\\', '$': '$', '`': '`'}
+
+
+def parse_env_file(text: str) -> Dict[str, str]:
+    """Read KEY=VALUE lines, as a .env file or a shell script of exports would set them.
+
+    Blank lines and # comments are skipped, `export ` is allowed, 'single' quotes are literal and
+    "double" quotes understand backslash escapes. Errors name the line number, never its contents.
+    """
+    values = {}
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip() or line.strip().startswith('#'):
+            continue
+        match = ENV_LINE_PATTERN.match(line)
+        if not match:
+            raise BWEnvError(f"Line {number} is not KEY=VALUE")
+        key, raw = match.groups()
+        values[key] = _env_value(raw, number)
+    return values
+
+
+def _env_value(raw: str, number: int) -> str:
+    """The value of one KEY=VALUE line, after quotes, escapes and any trailing comment"""
+    if raw[:1] not in ('"', "'"):
+        return re.split(r'\s+#', raw, maxsplit=1)[0].strip()
+
+    quote, value, i = raw[0], [], 1
+    while i < len(raw) and raw[i] != quote:
+        if quote == '"' and raw[i] == '\\' and i + 1 < len(raw):
+            i += 1
+            value.append(DOUBLE_QUOTE_ESCAPES.get(raw[i], '\\' + raw[i]))
+        else:
+            value.append(raw[i])
+        i += 1
+    rest = raw[i + 1:].strip()
+    if i >= len(raw):
+        raise BWEnvError(f"Line {number} has an unterminated quote (values over several lines are not supported)")
+    if rest and not rest.startswith('#'):
+        raise BWEnvError(f"Line {number} has text after its closing quote")
+    return ''.join(value)
+
+
 class BitwardenClient:
     """Client for interacting with Bitwarden CLI"""
     
     # Commands that need an unlocked vault
-    AUTH_COMMANDS = ('sync', 'list', 'get', 'send')
-    
-    def __init__(self, no_sync: bool = False):
+    AUTH_COMMANDS = ('sync', 'list', 'get', 'send', 'create', 'edit')
+
+    def __init__(self, no_sync: bool = False, session_cache: Optional[SessionCache] = None):
         self.sync = not no_sync
         self._session = os.environ.get('BW_SESSION')
         self._session_checked = False
+        self._session_cache = session_cache  # None: the platform's own, if BWENV_SESSION_CACHE is set
+        self._session_from_cache = False
+        self._session_cache_missing = False
         self._items_cache = None
         self._op_items_cache = None
         self._organizations_cache = None
@@ -330,21 +666,77 @@ class BitwardenClient:
         """Check the vault state once per client, unlocking it if it is locked"""
         if self._session_checked:
             return
-        
+
+        cache_seconds = session_cache_seconds()
+        if not self._session and cache_seconds:
+            self._load_cached_session()
+
         result = self._exec_bw(['status'])
         try:
             status = json.loads(result.stdout).get('status')
         except (json.JSONDecodeError, TypeError, AttributeError):
             status = None
         logging.debug(f"Vault status: {status}")
-        
+
+        if self._session_from_cache and status in ('locked', 'unauthenticated'):
+            logging.debug("The cached session no longer unlocks the vault; forgetting it")
+            self._forget_cached_session()
+            self._session = None
         if status == 'unauthenticated':
             raise BWEnvError("You are not logged in to Bitwarden. Run `bw login` first.")
         if status == 'locked':
             self._unlock()
+            if cache_seconds:
+                self._cache_session(cache_seconds)
         # 'unlocked', or a status we cannot read: let the command itself report any problem
         self._session_checked = True
-    
+
+    def _get_session_cache(self) -> Optional[SessionCache]:
+        if self._session_cache is None and not self._session_cache_missing:
+            self._session_cache = default_session_cache()
+            if self._session_cache is None:
+                print(f"Warning: {SESSION_CACHE_ENV} is set, but there is no session store here "
+                      f"(on Linux, install keyctl from keyutils)", file=sys.stderr)
+                self._session_cache_missing = True  # warn once
+        return self._session_cache
+
+    def _load_cached_session(self):
+        """Use a cached, unexpired session from an earlier run, if there is one"""
+        cache = self._get_session_cache()
+        if not cache:
+            return
+        try:
+            session = cache.load()
+        except (OSError, subprocess.SubprocessError, BWEnvError) as e:
+            logging.debug(f"Could not read the {cache.name}: {e}")
+            return
+        if session:
+            logging.debug(f"Using the session cached in the {cache.name}")
+            self._session = session
+            self._session_from_cache = True
+        else:
+            logging.debug(f"No unexpired session in the {cache.name}")
+
+    def _cache_session(self, seconds: int):
+        """Keep the session this client unlocked for later runs. A failure only costs a password prompt later."""
+        cache = self._get_session_cache()
+        if not cache or not self._session:
+            return
+        try:
+            cache.store(self._session, seconds)
+            logging.debug(f"Cached the session in the {cache.name} for {seconds} seconds")
+        except (OSError, subprocess.SubprocessError, BWEnvError) as e:
+            print(f"Warning: could not cache the Bitwarden session in the {cache.name}: {e}", file=sys.stderr)
+
+    def _forget_cached_session(self):
+        cache = self._get_session_cache()
+        if cache:
+            try:
+                cache.clear()
+            except (OSError, subprocess.SubprocessError) as e:
+                logging.debug(f"Could not clear the {cache.name}: {e}")
+        self._session_from_cache = False
+
     def _unlock(self):
         """Ask for the master password and keep the session for this client.
         
@@ -658,7 +1050,151 @@ class BitwardenClient:
 
         logging.debug("No matching item found")
         return None, ""
-    
+
+    def _split_write_uri(self, uri: str, min_parts: int) -> Tuple[Optional[str], List[str]]:
+        """Split a bw:// URI to write to into (organization ID or None, the parts after the vault)"""
+        if not uri.startswith('bw://'):
+            raise BWEnvError(f"bwenv can only store secrets at bw:// URIs, not {uri}")
+        parts = uri[5:].rstrip('/').split('/')
+        if len(parts) < min_parts + 1 or not all(parts):
+            raise BWEnvError(f"Invalid bw:// URI to store at: {uri}")
+        return self._resolve_organization(parts[0]), parts[1:]
+
+    def _items_named(self, org_id: Optional[str], path: str, name: str) -> List[Dict]:
+        """Items in this vault called `name`, in the folder/collection `path` if one is given"""
+        matches = [item for item in self._get_all_items()
+                   if item.get('organizationId') == org_id and item.get('name') == name]
+        if path:
+            container_ids = self._resolve_path_ids(org_id, path)
+            matches = [item for item in matches if self._item_in_containers(item, org_id, container_ids)]
+        return matches
+
+    def plan_field_write(self, uri: str) -> 'WriteTarget':
+        """Work out which item, and which field, a bw://vault/[folder/]item/FIELD URI writes to.
+
+        An existing item is preferred, matched like `read` does, except the field need not exist yet:
+        a split where the item already has the field wins; otherwise exactly one split may match an item.
+        With no matching item, a new one is named by the last-but-one part, and the field by the last.
+        """
+        org_id, parts = self._split_write_uri(uri, min_parts=2)
+        found = []
+        for split_point in range(1, len(parts)):
+            path, name, field = '/'.join(parts[:split_point - 1]), parts[split_point - 1], '/'.join(parts[split_point:])
+            matches = self._items_named(org_id, path, name)
+            if len(matches) > 1:
+                where = f"'{path}'" if path else "this vault"
+                raise BWEnvError(f"{len(matches)} items named '{name}' match in {where}; "
+                                 f"add the folder or collection to the URI to choose one")
+            if matches:
+                found.append(WriteTarget(org_id, path, name, field, matches[0]))
+
+        with_field = [t for t in found if self.get_field_value(t.item, t.field) is not None]
+        if len(with_field) == 1:
+            return with_field[0]
+
+        # A field that does not exist yet: the item/FIELD reading (last-but-one part, last part) must be the only one
+        new = WriteTarget(org_id, '/'.join(parts[:-2]), parts[-2], parts[-1], None)
+        if len(found) == 1 and (found[0].path, found[0].item_name) == (new.path, new.item_name):
+            return found[0]
+        if with_field or found:
+            meanings = [f"field '{t.field}' of '{t.item_name}'" for t in (with_field or found)]
+            if not with_field and not any(t.item_name == new.item_name and t.path == new.path for t in found):
+                meanings.append(f"a new item '{new.item_name}'" + (f" in '{new.path}'" if new.path else ''))
+            raise BWEnvError(f"{uri} could mean more than one item: {'; or '.join(meanings)}. "
+                             f"Use the folder or collection ID in the URI to choose one")
+        return new
+
+    def plan_item_write(self, uri: str) -> 'WriteTarget':
+        """The item a bw://vault/[folder/]item URI writes to: an existing one, or a new one to create"""
+        org_id, parts = self._split_write_uri(uri, min_parts=1)
+        path, name = '/'.join(parts[:-1]), parts[-1]
+        matches = self._items_named(org_id, path, name)
+        if len(matches) > 1:
+            where = f"'{path}'" if path else "this vault"
+            raise BWEnvError(f"{len(matches)} items named '{name}' match in {where}; "
+                             f"add the folder or collection to the URI to choose one")
+        return WriteTarget(org_id, path, name, '', matches[0] if matches else None)
+
+    def write_fields(self, target: 'WriteTarget', values: Dict[str, str]) -> Dict:
+        """Store the values in the target item, creating it (and its folder) if it does not exist yet.
+
+        Named fields are updated and every other field is kept; new fields are hidden custom fields.
+        The item reaches bw on stdin, never in argv or logs. The cache is updated, so a later read in
+        the same run sees the new values.
+        """
+        if target.item is None:
+            item = self._create_item(target, values)
+        else:
+            item = self._update_item(target.item['id'], values)
+        self._remember_item(item)
+        target.item = item
+        return item
+
+    def _container_for_write(self, org_id: Optional[str], path: str) -> Optional[str]:
+        """The ID of the folder (personal vault) or collection (organization) to create an item in"""
+        if org_id is not None and not path:
+            raise BWEnvError("An organization item needs a collection: bw://Org/Collection/item/FIELD")
+        if not path:
+            return None
+        ids = self._resolve_path_ids(org_id, path)
+        if len(ids) > 1:
+            raise BWEnvError(f"{len(ids)} folders or collections are called '{path}'; use its ID in the URI")
+        if ids:
+            return ids.pop()
+        if org_id is not None:
+            raise BWEnvError(f"Collection '{path}' not found; bwenv does not create collections, so create it "
+                             f"in Bitwarden first")
+
+        logging.debug(f"Creating folder '{path}'")
+        folder = json.loads(self._run_bw_command(['create', 'folder'], input_text=self._encode({'name': path})))
+        self._folders_cache = None
+        return folder['id']
+
+    def _create_item(self, target: 'WriteTarget', values: Dict[str, str]) -> Dict:
+        """Create a secure note holding the values as hidden custom fields"""
+        container_id = self._container_for_write(target.org_id, target.path)
+        logging.debug(f"Creating item '{target.item_name}' with {len(values)} field(s)")
+        item = {
+            "organizationId": target.org_id,
+            "collectionIds": [container_id] if target.org_id else None,
+            "folderId": None if target.org_id else container_id,
+            "type": 2,  # Secure note
+            "name": target.item_name,
+            "notes": None,
+            "favorite": False,
+            "fields": [{"name": name, "value": value, "type": 1, "linkedId": None} for name, value in values.items()],
+            "secureNote": {"type": 0},
+            "reprompt": 0,
+        }
+        return json.loads(self._run_bw_command(['create', 'item'], input_text=self._encode(item)))
+
+    def _update_item(self, item_id: str, values: Dict[str, str]) -> Dict:
+        """Set the named fields of an existing item, keeping the others"""
+        item = json.loads(self._run_bw_command(['get', 'item', item_id]))  # the current version, not the cached one
+        logging.debug(f"Updating {len(values)} field(s) in item '{item.get('name')}'")
+        fields = item.get('fields') or []
+        for name, value in values.items():
+            field = next((f for f in fields if f.get('name') == name), None)
+            if field is not None:
+                field['value'] = value
+            elif name in ('username', 'password') and item.get('login') is not None:
+                item['login'][name] = value
+            else:
+                fields.append({"name": name, "value": value, "type": 1, "linkedId": None})
+        item['fields'] = fields
+        return json.loads(self._run_bw_command(['edit', 'item', item_id], input_text=self._encode(item)))
+
+    def _remember_item(self, item: Dict):
+        """Put a created or edited item into the cache in place of the old copy"""
+        if self._items_cache is not None:
+            self._items_cache = [i for i in self._items_cache if i.get('id') != item.get('id')] + [item]
+        self._op_items_cache = None
+
+    @staticmethod
+    def _encode(data: Dict) -> str:
+        """Equivalent to `bw encode`, without an extra bw process"""
+        return base64.b64encode(json.dumps(data).encode('utf-8')).decode('ascii')
+
     def send_item(self, uri: str, name: Optional[str] = None, max_access: Optional[int] = 1,
                   expire_hours: float = 24.0) -> str:
         """Create a Bitwarden Send of a field value, or of a whole item as JSON, and return its URL.
@@ -929,8 +1465,80 @@ def send_item(args: argparse.Namespace):
         sys.exit(1)
 
 
+def set_secrets(args: argparse.Namespace):
+    """Ask for a value for each bw:// URI, masked, and store it"""
+    bw_client = BitwardenClient(no_sync=args.no_sync)
+    try:
+        # Check every URI before asking for anything, so a typo does not waste the values typed so far
+        targets = [bw_client.plan_field_write(uri) for uri in args.uri]
+        groups: Dict[tuple, List[WriteTarget]] = {}
+        for target in targets:
+            groups.setdefault(target.key, []).append(target)
+        for group in groups.values():
+            names = [t.field for t in group]
+            if len(set(names)) < len(names):
+                raise BWEnvError(f"The same field is named twice for item '{group[0].item_name}'")
+
+        for group in groups.values():
+            values = {}
+            for target in group:
+                state = 'replace' if target.item and bw_client.get_field_value(target.item, target.field) is not None else 'new'
+                values[target.field] = ask_secret_value(f"Value for {target.field} in {target.item_name} ({state}):")
+            bw_client.write_fields(group[0], values)
+            del values
+            for target in group:
+                print(f"Stored {target.field} in '{target.item_name}'", file=sys.stderr)
+    except BWEnvError as e:
+        logging.debug(f"Failed to store secret: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def import_env_file(args: argparse.Namespace):
+    """Copy the values of a KEY=VALUE file into hidden fields of one item, and print the references to use instead"""
+    bw_client = BitwardenClient(no_sync=args.no_sync)
+    try:
+        try:
+            if args.file == '-':
+                text = sys.stdin.read()
+            else:
+                with open(args.file, encoding='utf-8-sig') as f:
+                    text = f.read()
+        except OSError as e:
+            raise BWEnvError(f"Cannot read {args.file}: {e.strerror}")
+        values = parse_env_file(text)
+        del text
+        if not values:
+            raise BWEnvError(f"No KEY=VALUE lines in {args.file}")
+
+        target = bw_client.plan_item_write(args.uri)
+        bw_client.write_fields(target, values)
+        print(f"Stored {len(values)} field(s) in '{target.item_name}'", file=sys.stderr)
+        base = args.uri.rstrip('/')
+        for key in values:
+            print(f"{key}={base}/{key}")
+    except BWEnvError as e:
+        logging.debug(f"Failed to import: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def lock_session(args: argparse.Namespace):
+    """Forget the session cached by BWENV_SESSION_CACHE"""
+    cache = default_session_cache()
+    if cache is None:
+        print("There is no session store on this system, so nothing is cached", file=sys.stderr)
+        return
+    try:
+        cache.clear()
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"Error: could not clear the {cache.name}: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Forgot the cached Bitwarden session ({cache.name})", file=sys.stderr)
+
+
 BWENV_FLAGS = ('--debug', '--no-sync')
-SUBCOMMANDS = ('run', 'read', 'send')
+SUBCOMMANDS = ('run', 'read', 'send', 'set', 'import', 'lock')
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -957,6 +1565,16 @@ def build_parser() -> argparse.ArgumentParser:
                              help='How many times the send can be opened; 0 for unlimited (default: 1)')
     send_parser.add_argument('--expire-hours', type=float, default=24.0,
                              help='Hours until the send is deleted (default: 24)')
+
+    set_parser = subparsers.add_parser('set', help='Store secrets, asking for each value in a masked prompt')
+    set_parser.add_argument('uri', nargs='+',
+                            help='bw:// URI(s) of the field(s) to store (e.g., bw://myvault/Folder/item/API_TOKEN)')
+
+    import_parser = subparsers.add_parser('import', help='Copy the values of a KEY=VALUE file into an item')
+    import_parser.add_argument('uri', help='bw:// URI of the item to store them in (e.g., bw://myvault/Folder/item)')
+    import_parser.add_argument('file', help="KEY=VALUE file to read, or '-' for stdin")
+
+    subparsers.add_parser('lock', help=f'Forget the session cached by {SESSION_CACHE_ENV}')
     return parser
 
 
@@ -1032,6 +1650,12 @@ def main():
         read_secret(args)
     elif args.command == 'send':
         send_item(args)
+    elif args.command == 'set':
+        set_secrets(args)
+    elif args.command == 'import':
+        import_env_file(args)
+    elif args.command == 'lock':
+        lock_session(args)
 
 
 if __name__ == '__main__':
