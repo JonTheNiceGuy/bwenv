@@ -304,7 +304,11 @@ class KeyctlSessionCache(SessionCache):
         key_id = result.stdout.strip()
         if result.returncode != 0 or not key_id:
             raise BWEnvError(f"keyctl padd failed: {result.stderr.strip() or f'exit code {result.returncode}'}")
-        # Readable by the user's other processes (not only this one, the "possessor"), and nobody else's
+        # Readable by the user's other processes (not only this one, the "possessor"), and nobody else's.
+        # Changing that needs possession of the key, which a session keyring not linked to the user keyring
+        # (no pam_keyinit: CI runners, some services) lacks; link it, as pam_keyinit would, and try again.
+        if self._run([self.keyctl, 'setperm', key_id, '0x3f3f0000']).returncode != 0:
+            self._run([self.keyctl, 'link', '@u', '@s'])
         for args in (['setperm', key_id, '0x3f3f0000'], ['timeout', key_id, str(seconds)]):
             if self._run([self.keyctl] + args).returncode != 0:
                 self.clear()

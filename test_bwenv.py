@@ -1704,6 +1704,25 @@ class TestKeyctlSessionCache(unittest.TestCase):
         self.assertIn((['keyctl', 'setperm', '123', '0x3f3f0000'], None), calls)
         self.assertIn((['keyctl', 'timeout', '123', '600'], None), calls)
 
+    def test_links_the_user_keyring_when_the_key_is_not_possessed(self):
+        """Without pam_keyinit (CI, services) setperm is refused until @u is linked into the session keyring"""
+        linked = []
+
+        def run(command, **kwargs):
+            if command[1] == 'padd':
+                return Mock(returncode=0, stdout='123\n', stderr='')
+            if command[1] == 'search':
+                return Mock(returncode=1, stdout='', stderr='')
+            if command[1] == 'link':
+                linked.append(command[2:])
+            if command[1] == 'setperm' and not linked:
+                return Mock(returncode=1, stdout='', stderr='Permission denied')
+            return Mock(returncode=0, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=run):
+            bwenv.KeyctlSessionCache('keyctl').store('the_session', 600)
+        self.assertEqual(linked, [['@u', '@s']])
+
     @unittest.skipUnless(sys.platform.startswith('linux') and keyctl_works(), 'needs a usable keyctl')
     def test_real_keyring_round_trip_and_expiry(self):
         cache = bwenv.KeyctlSessionCache(bwenv.shutil.which('keyctl'), description='bwenv_unittest')
