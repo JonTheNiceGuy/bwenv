@@ -171,7 +171,10 @@ the reference. `--max-access 0` allows unlimited views. With several URIs, each 
 bwenv set bw://myvault/Work/github/GITHUB_TOKEN
 
 # Several at once; every URI is checked before anything is asked for
-bwenv set bw://myvault/Work/myapp/DB_PASSWORD bw://myvault/Work/myapp/API_KEY
+bwenv set bw://myvault/Work/myapp#DB_PASSWORD bw://myvault/Work/myapp#API_KEY
+
+# '#' names the item exactly, so even a new item can get a field containing '/'
+bwenv set bw://myvault/Work/ci#tokens/deploy
 ```
 
 The value never appears on a command line, in a log or in your shell history, and reaches `bw` on
@@ -181,16 +184,20 @@ stdin. `set` writes `bw://` URIs only:
   keeps every other field; a new field is a hidden custom field;
 - a missing item is created as a secure note in that folder, and a missing personal folder is created
   (organization collections must already exist);
-- for a new item, the last part of the URI is the field and the one before it is the item, so a field
-  name containing `/` can only be added to an item that already exists;
-- a URI that could mean more than one item is refused, as with `read`. That includes
-  `bw://myvault/Work/svc/TOKEN` when there is both a folder `Work` and an item called `Work`; use the
-  folder's ID instead of its name to choose.
+- with `#`, the URI names the item exactly: `bw://myvault/Work/svc#TOKEN` is item `svc` in folder `Work`,
+  existing or new, and nothing is guessed. Two items of that name in that folder are refused. So is a
+  URI that would create a new item where an existing item has a `#` in its name that the URI used to mean
+  (`bw://myvault/Work/odd#name/TOKEN` with an item `odd#name`): rename that item first;
+- with `/`, for a new item, the last part of the URI is the field and the one before it is the item, so
+  a field name containing `/` can only be added to an item that already exists (use `#` instead);
+- a `/` URI that could mean more than one item is refused, as with `read`. That includes
+  `bw://myvault/Work/svc/TOKEN` when there is both a folder `Work` and an item called `Work`; use `#`, or
+  the folder's ID instead of its name, to choose.
 
 #### Move a .env file into the vault:
 ```bash
 bwenv import bw://myvault/Work/myapp .env > .env.bwenv
-# .env.bwenv now holds KEY=bw://myvault/Work/myapp/KEY for every key. Check it, replace .env with it, and
+# .env.bwenv now holds KEY='bw://myvault/Work/myapp#KEY' for every key. Check it, replace .env with it, and
 # load it as before - the references are resolved when the app starts:
 mv .env.bwenv .env
 set -a; . ./.env; set +a; bwenv run your-app
@@ -198,7 +205,8 @@ set -a; . ./.env; set +a; bwenv run your-app
 
 `import` reads `KEY=VALUE` lines (with optional `export`, `#` comments, and `'single'` or
 `"double"` quotes), stores each value as a hidden custom field of the item (created if missing), and
-prints the references to use instead. Use `-` to read the file from stdin.
+prints the references to use instead, in the `#` form and quoted for the shell where needed (a shell,
+dotenv and bwenv all read them back unchanged). Use `-` to read the file from stdin.
 
 #### Use debug mode:
 ```bash
@@ -400,4 +408,4 @@ This is a community project. For support:
 - **v1.10**: Security and correctness release. Secrets no longer leak: `--debug` logs value lengths, never values; `send` no longer logs its payload and passes it to `bw` on stdin instead of the command line; `run` strips `BW_SESSION` and other Bitwarden credentials from the command's environment. Sends now default to one view, hidden text, hidden email and a generic name, with new `--max-access` and `--expire-hours` options, and `op://vault/item` whole-item sends work. Lookups no longer return the wrong secret: `bw://` URIs honour the folder or collection (an unknown one is an error), `op://` matches the exact item rather than any item whose name starts the same, and a reference matching several items is an error. Fixed `op://` finding nothing with current Bitwarden CLIs, whose `--search` no longer matches website URIs. `run -- npm run build` (and `docker`/`cargo`/`kubectl run`) works, and flags after your command are left for it. `run` execs the command on Linux and macOS, so it gets Ctrl-C and SIGTERM and its exit status is bwenv's. Every `bw` call has a timeout (`BWENV_TIMEOUT`), the vault is unlocked at most once and never from piped input, output is decoded as UTF-8, and an npm-installed `bw.cmd` is found on Windows. Item, organization, folder and collection lists are fetched once per run (thanks to @lewis-lees for the item cache). Requires Python 3.7+; tests run on Linux, macOS and Windows.
 - **v1.11**: Added a desktop password box for unlocking the vault when there is no terminal (an IDE, a GUI launcher, piped input): `osascript` on macOS, PowerShell on Windows, `kdialog` or `zenity` on Linux, with a `tkinter` fallback. A wrong password is asked for again up to 3 times. `BWENV_PROMPT` (`auto`, `gui`, `tty`, `none`) chooses how bwenv asks.
 - **v1.12**: Added `set`, which stores secrets typed into a masked prompt (terminal or password box), and `import`, which moves a `.env` file into hidden fields of one item and prints the references to use instead. Both create a missing item and personal folder, keep the item's other fields, pass values to `bw` on stdin, and refuse a URI that could mean more than one item. Added `BWENV_SESSION_CACHE` to keep an unlocked session between runs for a limited time (kernel keyring on Linux, a self-locking keychain on macOS, a DPAPI-encrypted file on Windows), and `lock` to forget it.
-- **v1.13**: Faster lookups. `bw://vault/[path/]item#field` names the item exactly, like a HashiCorp Vault path, instead of trying each `/` in turn. bwenv remembers the item each `bw://` reference found (`BWENV_ID_CACHE`, a text file of names and IDs) and fetches it by ID next time instead of listing the whole vault, checking that it still fits and searching when it does not. A cached session skips the `bw status` check and is only replaced when `bw` says the vault is locked. Sync happens at most once per run. With a cached session, a lookup on a ~1,000-item vault went from about 12s to 3.4s (`--no-sync`), and from 18s to 6s with sync.
+- **v1.13**: Faster lookups. `bw://vault/[path/]item#field` names the item exactly, like a HashiCorp Vault path, instead of trying each `/` in turn. bwenv remembers the item each `bw://` reference found (`BWENV_ID_CACHE`, a text file of names and IDs) and fetches it by ID next time instead of listing the whole vault, checking that it still fits and searching when it does not. A cached session skips the `bw status` check and is only replaced when `bw` says the vault is locked. Sync happens at most once per run. `set` takes the `#` form too, which names the item exactly (so a new item can have a field containing `/`), and `import` prints its references in the `#` form, quoted for the shell where needed (a folder or item name with a space used to break `. ./.env`). With a cached session, a lookup on a ~1,000-item vault went from about 12s to 3.4s (`--no-sync`), and from 18s to 6s with sync.

@@ -19,7 +19,7 @@ Examples:
     bwenv run --no-sync python app.py
     bwenv run -- npm run build
     bwenv send --max-access 3 op://Employee/example/secret
-    bwenv set bw://myvault/Work/github/GITHUB_TOKEN
+    bwenv set bw://myvault/Work/github#GITHUB_TOKEN
     bwenv import bw://myvault/Work/myapp .env > .env.bwenv
 
 Environment:
@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1278,12 +1279,20 @@ class BitwardenClient:
         return matches
 
     def plan_field_write(self, uri: str) -> 'WriteTarget':
-        """Work out which item, and which field, a bw://vault/[folder/]item/FIELD URI writes to.
+        """Work out which item, and which field, a bw://vault/[folder/]item/FIELD or ...item#FIELD URI writes to.
 
-        An existing item is preferred, matched like `read` does, except the field need not exist yet:
-        a split where the item already has the field wins; otherwise exactly one split may match an item.
-        With no matching item, a new one is named by the last-but-one part, and the field by the last.
+        With '#', the URI names the item exactly: that item, or a new one of that name in that folder.
+        With '/', an existing item is preferred, matched like `read` does, except the field need not exist
+        yet: a split where the item already has the field wins; otherwise exactly one split may match an
+        item. With no matching item, a new one is named by the last-but-one part, and the field by the last.
         """
+        exact = URIParser.split_bw_field(uri)
+        if exact:
+            return self._plan_exact_field_write(uri, *exact)
+        return self._plan_split_field_write(uri)
+
+    def _plan_split_field_write(self, uri: str) -> 'WriteTarget':
+        """plan_field_write for bw://vault/[folder/]item/FIELD, where '#' is an ordinary character"""
         org_id, parts = self._split_write_uri(uri, min_parts=2)
         found = []
         for split_point in range(1, len(parts)):
@@ -1311,6 +1320,26 @@ class BitwardenClient:
             raise BWEnvError(f"{uri} could mean more than one item: {'; or '.join(meanings)}. "
                              f"Use the folder or collection ID in the URI to choose one")
         return new
+
+    def _plan_exact_field_write(self, uri: str, item_ref: str, field: str) -> 'WriteTarget':
+        """The target of bw://vault/[folder/]item#FIELD: that item if it exists, else a new item to create"""
+        org_id, parts = self._split_write_uri(item_ref, min_parts=1)
+        path, name = '/'.join(parts[:-1]), parts[-1]
+        matches = self._items_named(org_id, path, name)
+        if len(matches) > 1:
+            where = f"'{path}'" if path else "this vault"
+            raise BWEnvError(f"{len(matches)} items named '{name}' match in {where}; "
+                             f"add the folder or collection to the URI to choose one")
+        if not matches:
+            # A '#' inside an existing item's name, from before #FIELD existed, must not become a new item
+            all_parts = self._split_write_uri(uri, min_parts=1)[1]
+            for count in range(1, len(all_parts)):
+                old_name = all_parts[count - 1]
+                if '#' in old_name and self._items_named(org_id, '/'.join(all_parts[:count - 1]), old_name):
+                    raise BWEnvError(f"{uri} would create a new item '{name}', but there is already an item "
+                                     f"'{old_name}' that the URI named before '#' marked the field. Rename "
+                                     f"that item so it has no '#', then try again")
+        return WriteTarget(org_id, path, name, field, matches[0] if matches else None)
 
     def plan_item_write(self, uri: str) -> 'WriteTarget':
         """The item a bw://vault/[folder/]item URI writes to: an existing one, or a new one to create"""
@@ -1724,7 +1753,7 @@ def import_env_file(args: argparse.Namespace):
         print(f"Stored {len(values)} field(s) in '{target.item_name}'", file=sys.stderr)
         base = args.uri.rstrip('/')
         for key in values:
-            print(f"{key}={base}/{key}")
+            print(f"{key}={shlex.quote(f'{base}#{key}')}")
     except BWEnvError as e:
         logging.debug(f"Failed to import: {e}")
         print(f"Error: {e}", file=sys.stderr)

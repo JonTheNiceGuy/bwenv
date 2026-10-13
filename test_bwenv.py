@@ -22,10 +22,14 @@ sys.path.insert(0, script_dir)
 # Import the bwenv module
 import bwenv
 
+REAL_SUBPROCESS_RUN = subprocess.run  # for the few tests that need a real process under a bw mock
+
 # Never open a real password dialog from the tests; dialog tests opt back in explicitly
 os.environ.setdefault('BWENV_PROMPT', 'tty')
 # Nor read or write the real item ID cache; ID cache tests give the client one of their own
 os.environ['BWENV_ID_CACHE'] = '0'
+# Nor pick up the real cached session; session cache tests set this themselves
+os.environ.pop('BWENV_SESSION_CACHE', None)
 
 
 def fake_bw(responses):
@@ -2172,6 +2176,40 @@ class TestSetCommand(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("bw:// URIs", stderr)
 
+    def test_hash_form_updates_a_field_with_slashes(self):
+        code, _ = self._set('bw://myvault/Demo/Data/DEMO_DATA#prod/plaintext')
+        self.assertEqual(code, 0)
+        fields = {f['name']: f['value'] for f in self.vault.item('DEMO_DATA')['fields']}
+        self.assertEqual(fields, {'prod/plaintext': self.SECRET, 'keep': 'k'})
+
+    def test_hash_form_creates_an_item_with_a_slashed_field(self):
+        """With '#' a new item can get a field containing '/', which the '/' form cannot express"""
+        code, _ = self._set('bw://myvault/Work/fresh#ci/token')
+        self.assertEqual(code, 0)
+        item = self.vault.item('fresh')
+        self.assertEqual(item['folderId'], 'f-work')
+        self.assertEqual([f['name'] for f in item['fields']], ['ci/token'])
+
+    def test_hash_form_never_guesses_the_folder(self):
+        """bw://myvault/Work#X is item 'Work' in no folder, never the folder Work"""
+        code, _ = self._set('bw://myvault/Work#TOKEN')
+        self.assertEqual(code, 0)
+        self.assertEqual([f['name'] for f in self.vault.item('Work')['fields']], ['TOKEN'])
+
+    def test_hash_form_refuses_an_ambiguous_item(self):
+        code, stderr = self._set('bw://myvault/Demo/Data/twin#X')
+        self.assertEqual(code, 1)
+        self.assertIn("2 items named 'twin'", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
+    def test_hash_inside_an_existing_item_name_is_not_a_new_item(self):
+        self.vault.items.append({"id": "odd", "name": "odd#name", "organizationId": None, "folderId": "f-work",
+                                 "type": 2, "fields": []})
+        code, stderr = self._set('bw://myvault/Work/odd#name/TOKEN')
+        self.assertEqual(code, 1)
+        self.assertIn("item 'odd#name'", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
     def test_a_later_read_in_the_same_run_sees_the_new_value(self):
         client = bwenv.BitwardenClient(no_sync=True)
         target = client.plan_field_write('bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext')
@@ -2266,8 +2304,16 @@ class TestImportCommand(unittest.TestCase):
         item = self.vault.item('myapp')
         self.assertEqual({f['name']: (f['value'], f['type']) for f in item['fields']},
                          {'DB_PASSWORD': ('pa ss', 1), 'API_KEY': ('k-123', 1)})
-        self.assertEqual(stdout, 'DB_PASSWORD=bw://myvault/Work/myapp/DB_PASSWORD\n'
-                                 'API_KEY=bw://myvault/Work/myapp/API_KEY\n')
+        self.assertEqual(stdout, "DB_PASSWORD='bw://myvault/Work/myapp#DB_PASSWORD'\n"
+                                 "API_KEY='bw://myvault/Work/myapp#API_KEY'\n")
+        # The printed file reads back, as bwenv, a shell and dotenv all read it, to references that resolve
+        references = bwenv.parse_env_file(stdout)
+        client = bwenv.BitwardenClient(no_sync=True)
+        self.assertEqual(client.resolve_bw_uri_to_value(references['DB_PASSWORD']), 'pa ss')
+        shell = REAL_SUBPROCESS_RUN(['sh', '-c', '. "$1"; printf %s "$API_KEY"', 'sh', '/dev/stdin'], input=stdout,
+                               capture_output=True, text=True) if not bwenv.IS_WINDOWS else None
+        if shell:
+            self.assertEqual(shell.stdout, 'bw://myvault/Work/myapp#API_KEY')
         for command, _ in self.vault.calls:
             self.assertNotIn('k-123', ' '.join(command))
 
