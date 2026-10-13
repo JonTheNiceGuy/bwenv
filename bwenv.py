@@ -26,6 +26,8 @@ Environment:
     BWENV_TIMEOUT        seconds to wait for each Bitwarden CLI call (default 120)
     BWENV_PROMPT         how to ask for passwords and values: auto (default), gui, tty or none
     BWENV_SESSION_CACHE  keep an unlocked session this long (e.g. 8h); unset or 0: do not keep it
+    BWENV_ID_CACHE       file remembering which item each bw:// reference found (default: the user
+                         cache directory, bwenv/item-ids); 0 or off: do not remember
 """
 
 import argparse
@@ -481,6 +483,83 @@ def default_session_cache() -> Optional[SessionCache]:
     return KeyctlSessionCache(keyctl) if keyctl else None
 
 
+ID_CACHE_ENV = 'BWENV_ID_CACHE'
+
+
+class ItemIdCache:
+    """Remembers which item a bw:// reference found, so the next run can `bw get item <id>` it.
+
+    A plain text file of `bw://vault/[path/]item=<item id>` lines, keyed without the field, so one
+    line serves every field of an item. It holds names and IDs, never values. An entry is only a
+    hint: bwenv checks the item it fetches and falls back to the full search when it no longer fits.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._entries = None  # type: Optional[Dict[str, str]]
+
+    @classmethod
+    def default(cls) -> Optional['ItemIdCache']:
+        """The cache BWENV_ID_CACHE names (a path, or 0/off to disable), else the platform's cache directory"""
+        setting = os.environ.get(ID_CACHE_ENV, '').strip()
+        if setting.lower() in ('0', 'off', 'false', 'no'):
+            return None
+        if setting:
+            return cls(os.path.expanduser(setting))
+        if IS_WINDOWS:
+            base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        elif sys.platform == 'darwin':
+            base = os.path.expanduser('~/Library/Caches')
+        else:
+            base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
+        return cls(os.path.join(base, 'bwenv', 'item-ids'))
+
+    def _load(self) -> Dict[str, str]:
+        if self._entries is None:
+            self._entries = {}
+            try:
+                with open(self.path, encoding='utf-8') as f:
+                    for line in f:
+                        key, sep, item_id = line.strip().rpartition('=')
+                        if sep and key.startswith('bw://') and item_id:
+                            self._entries[key] = item_id
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeDecodeError) as e:
+                logging.debug(f"Could not read the item ID cache {self.path}: {e}")
+        return self._entries
+
+    def get(self, key: str) -> Optional[str]:
+        return self._load().get(key)
+
+    def put(self, key: str, item_id: str):
+        entries = self._load()
+        if entries.get(key) != item_id:
+            entries[key] = item_id
+            self._save(entries)
+
+    def drop(self, key: str):
+        entries = self._load()
+        if entries.pop(key, None) is not None:
+            self._save(entries)
+
+    def _save(self, entries: Dict[str, str]):
+        """Write the whole file atomically, readable by this user only. A failure only costs speed."""
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+            temp = f"{self.path}.{os.getpid()}.tmp"
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write("# bwenv item ID cache: bw://vault/[path/]item=<item id>. Safe to delete.\n")
+                for key in sorted(entries):
+                    f.write(f"{key}={entries[key]}\n")
+            os.replace(temp, self.path)
+        except OSError as e:
+            logging.debug(f"Could not write the item ID cache {self.path}: {e}")
+
+
 class URIParser:
     """Parser for op:// and bw:// URIs"""
     
@@ -511,22 +590,34 @@ class URIParser:
     @classmethod
     def parse_bw_uri(cls, uri: str) -> Optional[str]:
         """
-        Validate a bw:// URI format - just check if it starts with bw:// and has at least 2 slashes
-        
+        Validate a bw:// URI format: bw://org/[path/]item/field, or bw://org/[path/]item#field
+
         Returns:
             The URI string if valid, None if invalid
         """
         if not uri.startswith('bw://'):
             return None
-        
+
+        if cls.split_bw_field(uri):
+            return uri
+
         # Count slashes after bw://
         path_part = uri[5:]  # Remove bw:// prefix
         slash_count = path_part.count('/')
-        
+
         if slash_count < 2:  # Need at least org/item/field
             return None
-            
+
         return uri
+
+    @staticmethod
+    def split_bw_field(uri: str) -> Optional[Tuple[str, str]]:
+        """Split bw://org/[path/]item#field into ('bw://org/[path/]item', 'field'); None without a usable '#'"""
+        item_ref, sep, field = uri.partition('#')
+        parts = item_ref[5:].split('/')
+        if not sep or not field or len(parts) < 2 or not all(parts):
+            return None
+        return item_ref, field
     
     @classmethod
     def parse_uri(cls, uri: str) -> Optional[Tuple[str, str, str]]:
@@ -614,10 +705,13 @@ class BitwardenClient:
     # Commands that need an unlocked vault
     AUTH_COMMANDS = ('sync', 'list', 'get', 'send', 'create', 'edit')
 
-    def __init__(self, no_sync: bool = False, session_cache: Optional[SessionCache] = None):
+    def __init__(self, no_sync: bool = False, session_cache: Optional[SessionCache] = None,
+                 id_cache: Optional['ItemIdCache'] = None, use_id_cache: bool = True):
         self.sync = not no_sync
+        self._synced = False
         self._session = os.environ.get('BW_SESSION')
         self._session_checked = False
+        self._session_unverified = False  # a cached session used without `bw status`; checked by its first use
         self._session_cache = session_cache  # None: the platform's own, if BWENV_SESSION_CACHE is set
         self._session_from_cache = False
         self._session_cache_missing = False
@@ -626,6 +720,7 @@ class BitwardenClient:
         self._organizations_cache = None
         self._folders_cache = None
         self._collections_cache = None
+        self._id_cache = id_cache if id_cache is not None or not use_id_cache else ItemIdCache.default()
 
     def _bw_env(self) -> Dict[str, str]:
         """Environment for bw: ours, plus the session this client unlocked (os.environ is never changed)"""
@@ -660,20 +755,42 @@ class BitwardenClient:
             self._ensure_unlocked()
         
         result = self._exec_bw(args, input_text)
+        if result.returncode != 0 and self._session_unverified and self._is_locked_error(result):
+            logging.debug("The cached session no longer unlocks the vault; forgetting it")
+            self._session_unverified = False
+            self._session_checked = False
+            self._forget_cached_session()
+            self._session = None
+            self._ensure_unlocked()
+            result = self._exec_bw(args, input_text)
+        self._session_unverified = False  # bw accepted the session, or failed for another reason
         logging.debug(f"bw {args[0]} exited {result.returncode}, stdout {len(result.stdout or '')} chars")
         if result.returncode != 0:
             stderr = result.stderr.strip() if isinstance(result.stderr, str) else ''
             raise BWEnvError(f"Bitwarden CLI error running 'bw {args[0]}': {stderr or f'exit code {result.returncode}'}")
         return result.stdout.strip()
     
+    @staticmethod
+    def _is_locked_error(result: subprocess.CompletedProcess) -> bool:
+        stderr = result.stderr if isinstance(result.stderr, str) else ''
+        return 'vault is locked' in stderr.lower() or 'not logged in' in stderr.lower()
+
     def _ensure_unlocked(self):
-        """Check the vault state once per client, unlocking it if it is locked"""
+        """Check the vault state once per client, unlocking it if it is locked.
+
+        A session from the cache skips `bw status` (a whole bw start-up): the command runs straight away,
+        and if bw says the vault is locked, _run_bw_command forgets the session, unlocks and runs it again.
+        """
         if self._session_checked:
             return
 
         cache_seconds = session_cache_seconds()
         if not self._session and cache_seconds:
             self._load_cached_session()
+            if self._session_from_cache:
+                self._session_checked = True
+                self._session_unverified = True
+                return
 
         result = self._exec_bw(['status'])
         try:
@@ -797,6 +914,12 @@ class BitwardenClient:
         
         raise BWEnvError(f"Failed to unlock the Bitwarden vault after {UNLOCK_ATTEMPTS} attempts")
     
+    def _sync_once(self):
+        """Sync before the first read of this run, unless --no-sync"""
+        if self.sync and not self._synced:
+            self.sync_vault()
+            self._synced = True
+
     def sync_vault(self):
         """Sync the Bitwarden vault"""
         logging.debug("Syncing Bitwarden vault...")
@@ -811,8 +934,7 @@ class BitwardenClient:
             logging.debug(f"Using cached items ({len(self._items_cache)} items)")
             return self._items_cache
 
-        if self.sync:
-            self.sync_vault()
+        self._sync_once()
 
         items_json = self._run_bw_command(['list', 'items'])
         self._items_cache = json.loads(items_json)
@@ -972,13 +1094,18 @@ class BitwardenClient:
         return bool(set(item.get('collectionIds') or []) & container_ids)
     
     def find_bw_item(self, uri: str) -> Tuple[Dict, str]:
-        """Find the item a bw:// URI names. Returns (item, field_name); field_name is '' for a whole-item URI."""
+        """Find the item a bw:// URI names. Returns (item, field_name); field_name is '' for a whole-item URI.
+
+        bw://org/[path/]item#field names its item exactly. bw://org/[path/]item/field is split at each '/'
+        in turn until an item has that field. Either way, an item found before is fetched by its ID first.
+        """
         logging.debug(f"Starting bw:// URI resolution: {uri}")
         
         if not uri.startswith('bw://'):
             raise BWEnvError(f"Invalid bw:// URI: {uri}")
         
-        parts = uri[5:].split('/')
+        exact = URIParser.split_bw_field(uri)
+        parts = (exact[0] if exact else uri)[5:].split('/')
         if len(parts) < 2:
             raise BWEnvError(f"bw:// URI must have at least org/item: {uri}")
         
@@ -986,14 +1113,91 @@ class BitwardenClient:
         remaining_parts = parts[1:]  # Everything after org
         logging.debug(f"Org/vault: {org_or_vault}, remaining parts: {remaining_parts}")
         
+        if exact:
+            splits = [(len(remaining_parts), exact[1])]
+        else:
+            splits = [(n, '/'.join(remaining_parts[n:])) for n in range(1, len(remaining_parts) + 1)]
+        cached = self._find_cached_item(org_or_vault, remaining_parts, splits)
+        if cached:
+            return cached
+
         org_id = self._resolve_organization(org_or_vault)
         logging.debug(f"Resolved organization '{org_or_vault}' to ID: {org_id}")
         
+        if exact:
+            path, name, field_name = '/'.join(remaining_parts[:-1]), remaining_parts[-1], exact[1]
+            matches = self._items_named(org_id, path, name)
+            if len(matches) > 1:
+                where = f"'{path}'" if path else "this vault"
+                raise BWEnvError(f"{len(matches)} items named '{name}' match in {where}; "
+                                 f"add the folder or collection to the URI to choose one")
+            if matches:
+                self._remember_item_id(exact[0], matches[0])
+                return matches[0], field_name
+            # Perhaps a '#' that is part of a name, from before #field existed: read it the old way
+            logging.debug(f"No item '{name}'; trying the URI without treating '#' as the field separator")
+            remaining_parts = uri[5:].split('/')[1:]
+
         # Try different splits of the remaining parts into path / item / field
         item, field_name = self._find_item_with_field_from_parts(org_id, remaining_parts)
         if not item:
             raise BWEnvError(f"No item found for bw:// URI: {uri}")
+        joined = '/'.join(remaining_parts)
+        item_part = joined[:len(joined) - len(field_name) - 1] if field_name else joined
+        self._remember_item_id(f"bw://{org_or_vault}/{item_part}", item)
         return item, field_name
+
+    def _find_cached_item(self, org_or_vault: str, parts: List[str],
+                          splits: List[Tuple[int, str]]) -> Optional[Tuple[Dict, str]]:
+        """Fetch the item an earlier run found for this reference by its ID: one `bw get` instead of listing
+        every item. splits are (number of parts naming the item, field), tried in the order a search would.
+        A fetched item must still have the name, vault and field the URI asks for; otherwise the entry is
+        dropped or ignored and the caller searches.
+        """
+        if not self._id_cache:
+            return None
+        for count, field_name in splits:
+            key = f"bw://{org_or_vault}/{'/'.join(parts[:count])}"
+            item_id = self._id_cache.get(key)
+            if not item_id:
+                continue
+            logging.debug(f"Item ID cache: {key} -> {item_id}")
+            item = self._get_item_by_id(item_id)
+            if not item or item.get('name') != parts[count - 1] or not self._in_vault(item, org_or_vault):
+                logging.debug(f"Item ID cache entry for {key} is stale; dropping it")
+                self._id_cache.drop(key)
+                continue
+            if field_name and self.get_field_value(item, field_name) is None:
+                continue
+            return item, field_name
+        return None
+
+    def _get_item_by_id(self, item_id: str) -> Optional[Dict]:
+        """One item by ID, or None if the vault has no such item"""
+        self._sync_once()
+        try:
+            return json.loads(self._run_bw_command(['get', 'item', item_id]))
+        except BWEnvError as e:
+            if 'not found' in str(e).lower():
+                return None
+            raise
+        except json.JSONDecodeError:
+            return None
+
+    def _in_vault(self, item: Dict, org_or_vault: str) -> bool:
+        """Whether an item belongs to the vault a URI names, without listing organizations to check a name"""
+        org_id = item.get('organizationId')
+        if org_or_vault in ('myvault', 'unassigned'):
+            return org_id is None
+        if len(org_or_vault) == 36 and org_or_vault.count('-') == 4:
+            return org_id == org_or_vault
+        if self._organizations_cache is not None:
+            return any(o.get('id') == org_id and o.get('name') == org_or_vault for o in self._organizations_cache)
+        return org_id is not None
+
+    def _remember_item_id(self, key: str, item: Dict):
+        if self._id_cache and item.get('id'):
+            self._id_cache.put(key, item['id'])
     
     def resolve_bw_uri_to_value(self, uri: str) -> str:
         """Resolve a complete bw:// URI to its field value"""

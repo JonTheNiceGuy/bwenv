@@ -107,6 +107,7 @@ rather than picking one.
 
 #### Bitwarden Native Format
 `bw://vault_or_org/folder_or_collection/item_name/field_name`
+or, naming the item exactly, `bw://vault_or_org/folder_or_collection/item_name#field_name`
 
 - `vault_or_org`: Vault name, organization name, or UUID
 - `folder_or_collection`: Folder name, collection name, or UUID (use "myvault" or "unassigned" for personal vault items). Optional when the item name is unique.
@@ -121,6 +122,13 @@ rather than picking one.
 - The folder (personal vault) or collection (organization) must match exactly: its full name, such as `Demo/Data` for a nested collection, or its UUID. One segment of a nested name does not match.
 - A folder or collection that does not exist is an error; bwenv never falls back to a same-named item elsewhere.
 - Without a folder or collection, the item name must be unique in that vault or organization. If two items share the name, bwenv stops with an error asking for the folder or collection rather than guessing.
+
+**Slash or `#` before the field:**
+- With `/`, bwenv works out where the item name ends: it tries each `/` in turn until an item with that name has that field. Field names may contain `/` (`bw://myvault/demo/prod/plaintext`).
+- With `#`, everything before it is the folder or collection and the item, and everything after it is the field, like a HashiCorp Vault path: `bw://myvault/Work/github#tokens/ci`. Nothing is guessed, and a missing field is reported as such.
+- A URI whose `#` belongs to an item name (from before `#` had a meaning) still works: if no item matches the `#` reading, bwenv reads the URI the `/` way.
+
+**Remembering items (`BWENV_ID_CACHE`):** listing every item is most of a lookup's time. bwenv remembers which item each reference found, in a text file of `bw://vault/[path/]item=<item id>` lines (one line per item, whichever field you read), and next time fetches that one item by ID. On a large vault this cut a cached-session lookup from about 12s to 3.5s. The file holds item names and IDs, never values, and is readable by you only: `~/.cache/bwenv/item-ids` on Linux (`$XDG_CACHE_HOME` if set), `~/Library/Caches/bwenv/item-ids` on macOS, `%LOCALAPPDATA%\bwenv\item-ids` on Windows. Set `BWENV_ID_CACHE` to another path, or to `0`/`off` to turn it off. An entry is only a hint: bwenv still syncs first (unless `--no-sync`), checks that the fetched item has the name, vault and field asked for, and searches as before when it does not, dropping an entry whose item has gone or been renamed. An item moved to another folder keeps resolving through its entry; delete the file to forget it.
 
 ### Examples
 
@@ -253,8 +261,8 @@ The tool handles Bitwarden authentication automatically:
    - **Windows**: a file encrypted to your account with DPAPI (`%LOCALAPPDATA%\bwenv\session.bin`) that
      records its own expiry.
 
-   An inherited `BW_SESSION` always wins. A cached session that no longer unlocks the vault is discarded and
-   you are asked again. `bwenv lock` forgets it at once (`bw lock` also invalidates it, and every other session).
+   An inherited `BW_SESSION` always wins. A cached session is used without a `bw status` check first; if `bw`
+   answers that the vault is locked, the session is discarded, you are asked again, and the command is retried. `bwenv lock` forgets it at once (`bw lock` also invalidates it, and every other session).
 
 ## Field Types
 
@@ -392,3 +400,4 @@ This is a community project. For support:
 - **v1.10**: Security and correctness release. Secrets no longer leak: `--debug` logs value lengths, never values; `send` no longer logs its payload and passes it to `bw` on stdin instead of the command line; `run` strips `BW_SESSION` and other Bitwarden credentials from the command's environment. Sends now default to one view, hidden text, hidden email and a generic name, with new `--max-access` and `--expire-hours` options, and `op://vault/item` whole-item sends work. Lookups no longer return the wrong secret: `bw://` URIs honour the folder or collection (an unknown one is an error), `op://` matches the exact item rather than any item whose name starts the same, and a reference matching several items is an error. Fixed `op://` finding nothing with current Bitwarden CLIs, whose `--search` no longer matches website URIs. `run -- npm run build` (and `docker`/`cargo`/`kubectl run`) works, and flags after your command are left for it. `run` execs the command on Linux and macOS, so it gets Ctrl-C and SIGTERM and its exit status is bwenv's. Every `bw` call has a timeout (`BWENV_TIMEOUT`), the vault is unlocked at most once and never from piped input, output is decoded as UTF-8, and an npm-installed `bw.cmd` is found on Windows. Item, organization, folder and collection lists are fetched once per run (thanks to @lewis-lees for the item cache). Requires Python 3.7+; tests run on Linux, macOS and Windows.
 - **v1.11**: Added a desktop password box for unlocking the vault when there is no terminal (an IDE, a GUI launcher, piped input): `osascript` on macOS, PowerShell on Windows, `kdialog` or `zenity` on Linux, with a `tkinter` fallback. A wrong password is asked for again up to 3 times. `BWENV_PROMPT` (`auto`, `gui`, `tty`, `none`) chooses how bwenv asks.
 - **v1.12**: Added `set`, which stores secrets typed into a masked prompt (terminal or password box), and `import`, which moves a `.env` file into hidden fields of one item and prints the references to use instead. Both create a missing item and personal folder, keep the item's other fields, pass values to `bw` on stdin, and refuse a URI that could mean more than one item. Added `BWENV_SESSION_CACHE` to keep an unlocked session between runs for a limited time (kernel keyring on Linux, a self-locking keychain on macOS, a DPAPI-encrypted file on Windows), and `lock` to forget it.
+- **v1.13**: Faster lookups. `bw://vault/[path/]item#field` names the item exactly, like a HashiCorp Vault path, instead of trying each `/` in turn. bwenv remembers the item each `bw://` reference found (`BWENV_ID_CACHE`, a text file of names and IDs) and fetches it by ID next time instead of listing the whole vault, checking that it still fits and searching when it does not. A cached session skips the `bw status` check and is only replaced when `bw` says the vault is locked. Sync happens at most once per run. With a cached session, a lookup on a ~1,000-item vault went from about 12s to 3.4s (`--no-sync`), and from 18s to 6s with sync.
