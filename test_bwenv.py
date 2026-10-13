@@ -22,8 +22,14 @@ sys.path.insert(0, script_dir)
 # Import the bwenv module
 import bwenv
 
+REAL_SUBPROCESS_RUN = subprocess.run  # for the few tests that need a real process under a bw mock
+
 # Never open a real password dialog from the tests; dialog tests opt back in explicitly
 os.environ.setdefault('BWENV_PROMPT', 'tty')
+# Nor read or write the real item ID cache; ID cache tests give the client one of their own
+os.environ['BWENV_ID_CACHE'] = '0'
+# Nor pick up the real cached session; session cache tests set this themselves
+os.environ.pop('BWENV_SESSION_CACHE', None)
 
 
 def fake_bw(responses):
@@ -1581,6 +1587,8 @@ class TestSessionCacheUse(unittest.TestCase):
                 return Mock(returncode=0, stdout=json.dumps({"status": "unlocked" if unlocked else "locked"}), stderr='')
             if command[:2] == ['bw', 'unlock']:
                 return Mock(returncode=0, stdout=self.UNLOCKED_BY + '\n', stderr='')
+            if kwargs['env'].get('BW_SESSION') not in self.valid_sessions:
+                return Mock(returncode=1, stdout='', stderr='Vault is locked.')
             return Mock(returncode=0, stdout='[]', stderr='')
 
         patcher = patch('subprocess.run', side_effect=run)
@@ -1672,6 +1680,174 @@ class TestSessionCacheUse(unittest.TestCase):
         with patch.object(bwenv, 'default_session_cache', return_value=cache), patch('builtins.print'):
             bwenv.lock_session(argparse.Namespace())
         self.assertIsNone(cache.session)
+
+    def test_a_cached_session_skips_the_status_check(self):
+        """A cached session is used straight away: no `bw status` start-up before the command"""
+        self.valid_sessions.add('cached_session')
+        self._list_items(MemorySessionCache('cached_session'))
+        commands = [c[0][0][1] for c in self.mock_run.call_args_list]
+        self.assertEqual(commands, ['list'])
+
+    def test_a_stale_cached_session_runs_the_command_again_after_unlocking(self):
+        """bw saying the vault is locked costs one retry, with the freshly unlocked session"""
+        self._list_items(MemorySessionCache('stale_session'))
+        self.assertEqual(self._session_given_to('list'), ['stale_session', self.UNLOCKED_BY])
+
+
+class TestBwUriFieldSeparator(unittest.TestCase):
+    """bw://vault/[path/]item#field names its item exactly"""
+
+    ITEMS = TestBwUriPathResolution.ITEMS + [
+        {"id": "h1", "name": "a#b", "organizationId": None, "folderId": None,
+         "fields": [{"name": "f", "value": "HASH-IN-NAME"}]},
+    ]
+
+    def setUp(self):
+        responses = {
+            ('bw', 'list', 'items'): json.dumps(self.ITEMS),
+            ('bw', 'list', 'folders'): json.dumps(TestBwUriPathResolution.FOLDERS),
+        }
+        patcher = patch('subprocess.run', side_effect=fake_bw(responses))
+        self.mock_run = patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        self.client = bwenv.BitwardenClient(no_sync=True)
+
+    def test_parser_accepts_the_field_separator(self):
+        for uri in ('bw://myvault/orchestra#TOKEN', 'bw://myvault/Dev/DEMO_DATA#secret', 'bw://myvault/x#a/b#c'):
+            self.assertTrue(bwenv.URIParser.is_bw_uri(uri), uri)
+        for uri in ('bw://myvault#TOKEN', 'bw://myvault/item#', 'bw:///item#f', 'bw://myvault//item#f'):
+            self.assertIsNone(bwenv.URIParser.split_bw_field(uri), uri)
+
+    def test_field_after_hash_may_hold_slashes(self):
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/ONLY_ONE#prod/plaintext'), 'A Dummy String')
+
+    def test_path_before_the_item(self):
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/Dev/DEMO_DATA#secret'), 'DEV-VALUE')
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/Prod/DEMO_DATA#secret'), 'PROD-VALUE')
+
+    def test_ambiguous_item_is_still_an_error(self):
+        with self.assertRaises(bwenv.BWEnvError):
+            self.client.resolve_bw_uri_to_value('bw://myvault/DEMO_DATA#secret')
+
+    def test_missing_field_is_named(self):
+        with self.assertRaises(bwenv.BWEnvError) as ctx:
+            self.client.resolve_bw_uri_to_value('bw://myvault/ONLY_ONE#nope')
+        self.assertIn("'nope'", str(ctx.exception))
+
+    def test_hash_in_an_item_name_still_works_the_old_way(self):
+        self.assertEqual(self.client.resolve_bw_uri_to_value('bw://myvault/a#b/f'), 'HASH-IN-NAME')
+
+
+class TestItemIdCache(unittest.TestCase):
+    """An item found once is fetched by ID next time, and a stale entry falls back to the search"""
+
+    ITEMS = TestBwUriPathResolution.ITEMS
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, 'sub', 'item-ids')
+        self.items = {item['id']: item for item in self.ITEMS}
+
+        def run(command, **kwargs):
+            if command[:3] == ['bw', 'get', 'item']:
+                item = self.items.get(command[3])
+                return Mock(returncode=0, stdout=json.dumps(item), stderr='') if item else \
+                    Mock(returncode=1, stdout='', stderr='Not found.')
+            return fake_bw({('bw', 'list', 'items'): json.dumps(list(self.items.values())),
+                            ('bw', 'list', 'folders'): json.dumps(TestBwUriPathResolution.FOLDERS),
+                            ('bw', 'list', 'organizations'): json.dumps(TestBwUriPathResolution.ORGANIZATIONS),
+                            ('bw', 'list', 'collections'): json.dumps(TestBwUriPathResolution.COLLECTIONS),
+                            })(command, **kwargs)
+
+        patcher = patch('subprocess.run', side_effect=run)
+        self.mock_run = patcher.start()
+        self.addCleanup(patcher.stop)
+        env_patcher = patch.dict(os.environ, {'BW_SESSION': 'test_session_token'})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+    def _read(self, uri, no_sync=True):
+        self.mock_run.reset_mock()
+        client = bwenv.BitwardenClient(no_sync=no_sync, id_cache=bwenv.ItemIdCache(self.path))
+        return client.resolve_bw_uri_to_value(uri)
+
+    def _commands(self):
+        return [c[0][0][1:3] for c in self.mock_run.call_args_list if c[0][0] != ['bw', 'status']]
+
+    def test_second_run_fetches_by_id(self):
+        self.assertEqual(self._read('bw://myvault/Dev/DEMO_DATA/secret'), 'DEV-VALUE')
+        self.assertIn(['list', 'items'], self._commands())
+        self.assertEqual(self._read('bw://myvault/Dev/DEMO_DATA/secret'), 'DEV-VALUE')
+        self.assertEqual(self._commands(), [['get', 'item']])
+
+    def test_one_entry_serves_both_uri_forms(self):
+        self._read('bw://myvault/Dev/DEMO_DATA/secret')
+        self.assertEqual(self._read('bw://myvault/Dev/DEMO_DATA#secret'), 'DEV-VALUE')
+        self.assertEqual(self._commands(), [['get', 'item']])
+        with open(self.path) as f:
+            self.assertIn('bw://myvault/Dev/DEMO_DATA=p2\n', f.read())
+
+    def test_slashes_in_the_field_are_not_part_of_the_key(self):
+        self._read('bw://myvault/ONLY_ONE/prod/plaintext')
+        with open(self.path) as f:
+            self.assertIn('bw://myvault/ONLY_ONE=p3\n', f.read())
+        self.assertEqual(self._read('bw://myvault/ONLY_ONE/prod/plaintext'), 'A Dummy String')
+        self.assertEqual(self._commands(), [['get', 'item']])
+
+    def test_sync_still_happens_once_before_the_fetch(self):
+        self._read('bw://myvault/Dev/DEMO_DATA/secret')
+        self._read('bw://myvault/Dev/DEMO_DATA/secret', no_sync=False)
+        self.assertEqual(self._commands(), [['sync'], ['get', 'item']])
+
+    def test_deleted_item_falls_back_to_the_search(self):
+        self._read('bw://myvault/Dev/DEMO_DATA/secret')
+        bwenv.ItemIdCache(self.path).put('bw://myvault/Dev/DEMO_DATA', 'gone')
+        self.assertEqual(self._read('bw://myvault/Dev/DEMO_DATA/secret'), 'DEV-VALUE')
+        self.assertEqual(bwenv.ItemIdCache(self.path).get('bw://myvault/Dev/DEMO_DATA'), 'p2')
+
+    def test_an_entry_pointing_at_another_name_is_not_trusted(self):
+        bwenv.ItemIdCache(self.path).put('bw://myvault/Dev/DEMO_DATA', 'p3')  # ONLY_ONE
+        self.assertEqual(self._read('bw://myvault/Dev/DEMO_DATA/secret'), 'DEV-VALUE')
+
+    def test_an_entry_pointing_into_another_vault_is_not_trusted(self):
+        bwenv.ItemIdCache(self.path).put('bw://myvault/Prod/DEMO_DATA', 'o1')  # an organization item
+        self.assertEqual(self._read('bw://myvault/Prod/DEMO_DATA/secret'), 'PROD-VALUE')
+
+    def test_organization_items_are_cached_too(self):
+        self._read('bw://Example Org/Demo/Data/DEMO_DATA/secret')
+        self.assertEqual(self._read('bw://Example Org/Demo/Data/DEMO_DATA/secret'), 'ORG-DEMO-VALUE')
+        self.assertEqual(self._commands(), [['get', 'item']])
+
+    def test_file_holds_names_and_ids_only(self):
+        self._read('bw://myvault/Dev/DEMO_DATA/secret')
+        with open(self.path) as f:
+            text = f.read()
+        self.assertNotIn('DEV-VALUE', text)
+        if not bwenv.IS_WINDOWS:
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_unreadable_lines_are_ignored(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, 'w') as f:
+            f.write("# comment\nnonsense\nbw://myvault/a=b=c=id-1\n\n")
+        cache = bwenv.ItemIdCache(self.path)
+        self.assertEqual(cache.get('bw://myvault/a=b=c'), 'id-1')
+        self.assertIsNone(cache.get('nonsense'))
+
+    def test_setting(self):
+        with patch.dict(os.environ, {'BWENV_ID_CACHE': 'off'}):
+            self.assertIsNone(bwenv.ItemIdCache.default())
+        with patch.dict(os.environ, {'BWENV_ID_CACHE': self.path}):
+            self.assertEqual(bwenv.ItemIdCache.default().path, self.path)
+        with patch.dict(os.environ, {'BWENV_ID_CACHE': '', 'XDG_CACHE_HOME': self.dir}):
+            if not bwenv.IS_WINDOWS and sys.platform != 'darwin':
+                self.assertEqual(bwenv.ItemIdCache.default().path, os.path.join(self.dir, 'bwenv', 'item-ids'))
+
 
 
 def keyctl_works():
@@ -2000,6 +2176,40 @@ class TestSetCommand(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("bw:// URIs", stderr)
 
+    def test_hash_form_updates_a_field_with_slashes(self):
+        code, _ = self._set('bw://myvault/Demo/Data/DEMO_DATA#prod/plaintext')
+        self.assertEqual(code, 0)
+        fields = {f['name']: f['value'] for f in self.vault.item('DEMO_DATA')['fields']}
+        self.assertEqual(fields, {'prod/plaintext': self.SECRET, 'keep': 'k'})
+
+    def test_hash_form_creates_an_item_with_a_slashed_field(self):
+        """With '#' a new item can get a field containing '/', which the '/' form cannot express"""
+        code, _ = self._set('bw://myvault/Work/fresh#ci/token')
+        self.assertEqual(code, 0)
+        item = self.vault.item('fresh')
+        self.assertEqual(item['folderId'], 'f-work')
+        self.assertEqual([f['name'] for f in item['fields']], ['ci/token'])
+
+    def test_hash_form_never_guesses_the_folder(self):
+        """bw://myvault/Work#X is item 'Work' in no folder, never the folder Work"""
+        code, _ = self._set('bw://myvault/Work#TOKEN')
+        self.assertEqual(code, 0)
+        self.assertEqual([f['name'] for f in self.vault.item('Work')['fields']], ['TOKEN'])
+
+    def test_hash_form_refuses_an_ambiguous_item(self):
+        code, stderr = self._set('bw://myvault/Demo/Data/twin#X')
+        self.assertEqual(code, 1)
+        self.assertIn("2 items named 'twin'", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
+    def test_hash_inside_an_existing_item_name_is_not_a_new_item(self):
+        self.vault.items.append({"id": "odd", "name": "odd#name", "organizationId": None, "folderId": "f-work",
+                                 "type": 2, "fields": []})
+        code, stderr = self._set('bw://myvault/Work/odd#name/TOKEN')
+        self.assertEqual(code, 1)
+        self.assertIn("item 'odd#name'", stderr)
+        self.assertEqual(self.vault.writes(), [])
+
     def test_a_later_read_in_the_same_run_sees_the_new_value(self):
         client = bwenv.BitwardenClient(no_sync=True)
         target = client.plan_field_write('bw://myvault/Demo/Data/DEMO_DATA/prod/plaintext')
@@ -2094,8 +2304,16 @@ class TestImportCommand(unittest.TestCase):
         item = self.vault.item('myapp')
         self.assertEqual({f['name']: (f['value'], f['type']) for f in item['fields']},
                          {'DB_PASSWORD': ('pa ss', 1), 'API_KEY': ('k-123', 1)})
-        self.assertEqual(stdout, 'DB_PASSWORD=bw://myvault/Work/myapp/DB_PASSWORD\n'
-                                 'API_KEY=bw://myvault/Work/myapp/API_KEY\n')
+        self.assertEqual(stdout, "DB_PASSWORD='bw://myvault/Work/myapp#DB_PASSWORD'\n"
+                                 "API_KEY='bw://myvault/Work/myapp#API_KEY'\n")
+        # The printed file reads back, as bwenv, a shell and dotenv all read it, to references that resolve
+        references = bwenv.parse_env_file(stdout)
+        client = bwenv.BitwardenClient(no_sync=True)
+        self.assertEqual(client.resolve_bw_uri_to_value(references['DB_PASSWORD']), 'pa ss')
+        shell = REAL_SUBPROCESS_RUN(['sh', '-c', '. "$1"; printf %s "$API_KEY"', 'sh', '/dev/stdin'], input=stdout,
+                               capture_output=True, text=True) if not bwenv.IS_WINDOWS else None
+        if shell:
+            self.assertEqual(shell.stdout, 'bw://myvault/Work/myapp#API_KEY')
         for command, _ in self.vault.calls:
             self.assertNotIn('k-123', ' '.join(command))
 
